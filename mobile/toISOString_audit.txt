@@ -1,0 +1,194 @@
+==================================================================
+ toISOString() AUDIT
+ Project root: /home/mac/dailybrief
+ Generated:    11 Julai 2026 01:29:00 asubuhi EAT
+==================================================================
+
+NOTE: toISOString() itself is not automatically a bug — only
+toISOString().slice(0, 10) (or similar date-only truncation) is,
+since it reads the date in UTC instead of local time. Full-
+timestamp uses (created_at, delivered_at, snoozed_until, etc.)
+are fine as-is. Every hit below is included so it can be checked.
+
+------------------------------------------------------------------
+FILE: /home/mac/dailybrief/lib/recurrence-engine.ts
+------------------------------------------------------------------
+8-
+9-const GRACE_MINUTES = 1; // how long after due-time to wait, if no snooze, before analyzing
+10-
+11:// Local YYYY-MM-DD — never use toISOString() for date-only values: it reads UTC,
+12-// which drifts a day off near midnight in timezones ahead of UTC (e.g. Nairobi, UTC+3).
+13-function toLocalISODate(d: Date): string {
+14-  const y = d.getFullYear();
+--
+100-
+101-/** Entry point — call on app foreground and on a periodic interval while the app is open. */
+102-export async function runRecurrenceSweep(): Promise<void> {
+103:  const nowISO = new Date().toISOString();
+104-  try {
+105-    const staleReminders = await db.getStaleReminders(nowISO, GRACE_MINUTES);
+106-    for (const r of staleReminders) {
+
+------------------------------------------------------------------
+FILE: /home/mac/dailybrief/lib/app-context.tsx
+------------------------------------------------------------------
+10-import * as recurrenceEngine from "@/lib/recurrence-engine";
+11-import type { BriefContext, BriefMode, User } from "@/lib/types";
+12-
+13:// Local date (not UTC) as YYYY-MM-DD. toISOString() is UTC and caused the brief to
+14-// pick the wrong calendar day whenever local time and UTC disagreed on the date
+15-// (e.g. late evening in a UTC+ timezone).
+16-function localISODate(d: Date): string {
+
+------------------------------------------------------------------
+FILE: /home/mac/dailybrief/lib/lead-time.ts
+------------------------------------------------------------------
+15-  const lead = LEAD_DAYS[category] ?? 0;
+16-  const d = new Date(dueDateISO + "T00:00:00");
+17-  d.setDate(d.getDate() - lead);
+18:  return d.toISOString().slice(0, 10);
+19-}
+20-
+21-/** True if todayISO falls inside [leadDate, dueDate] — i.e. it belongs in today's brief. */
+--
+36-  if (category !== "deadline") return false;
+37-  const tomorrow = new Date(todayISO + "T00:00:00");
+38-  tomorrow.setDate(tomorrow.getDate() + 1);
+39:  return dueDateISO === tomorrow.toISOString().slice(0, 10);
+40-}
+41-
+42-export type TimedItem = { id: number; title: string; date: string; time: string };
+
+------------------------------------------------------------------
+FILE: /home/mac/dailybrief/lib/db.ts
+------------------------------------------------------------------
+167-  chime_sound?: string;
+168-}): Promise<User> {
+169-  const db = await getDb();
+170:  const now = new Date().toISOString();
+171-  const result = await db.runAsync(
+172-    `INSERT INTO users
+173-      (name, age, onboarding_reasons, voice_id, voice_id_male, voice_id_female,
+--
+260-      state.isTrial ? 1 : 0,
+261-      state.expirationLabel,
+262-      state.store,
+263:      new Date().toISOString(),
+264-    ]
+265-  );
+266-}
+--
+301-  raw_input?: string;
+302-}): Promise<number> {
+303-  const db = await getDb();
+304:  const now = new Date().toISOString();
+305-  const result = await db.runAsync(
+306-    `INSERT INTO notes (title, content, created_at, source, tags, category, event_date, event_time, raw_input)
+307-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+--
+358-  raw_input?: string;
+359-}): Promise<number> {
+360-  const db = await getDb();
+361:  const now = new Date().toISOString();
+362-  const result = await db.runAsync(
+363-    `INSERT INTO calendar_events (title, details, date, time, time_range_end, created_at, reminded, category, recurrence, raw_input)
+364-     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+--
+439-  raw_input?: string;
+440-}): Promise<number> {
+441-  const db = await getDb();
+442:  const now = new Date().toISOString();
+443-  const result = await db.runAsync(
+444-    `INSERT INTO reminders
+445-      (title, details, due_date, due_time, time_range_end, snoozed_until, completed, created_at,
+--
+561-    `SELECT * FROM reminders WHERE completed = 0 AND (snoozed_until IS NULL OR snoozed_until <= ?)
+562-       AND (due_date IS NULL OR due_date <= ?)
+563-       ORDER BY due_time ASC NULLS LAST`,
+564:    [new Date().toISOString(), date]
+565-  );
+566-}
+567-
+--
+599-export async function markBriefDelivered(id: number): Promise<void> {
+600-  const db = await getDb();
+601-  await db.runAsync(`UPDATE daily_briefs_log SET delivered_at = ? WHERE id = ?`, [
+602:    new Date().toISOString(),
+603-    id,
+604-  ]);
+605-}
+
+------------------------------------------------------------------
+FILE: /home/mac/dailybrief/app/(tabs)/index.tsx
+------------------------------------------------------------------
+41-
+42-const COLLAPSED_LINES = 3;
+43-
+44:// Local YYYY-MM-DD — never use toISOString() for date-only values: it reads UTC,
+45-// which drifts a day off near midnight in timezones ahead of UTC (e.g. Nairobi, UTC+3).
+46-function toLocalISODate(d: Date): string {
+47-  const y = d.getFullYear();
+
+------------------------------------------------------------------
+FILE: /home/mac/dailybrief/app/(tabs)/calendar.tsx
+------------------------------------------------------------------
+23-
+24-type Section = { title: string; data: CalendarEvent[] };
+25-
+26:// Local YYYY-MM-DD — never use toISOString() for date-only values: it reads UTC,
+27-// which drifts a day off near midnight in timezones ahead of UTC (e.g. Nairobi, UTC+3).
+28-function toLocalISODate(d: Date): string {
+29-  const y = d.getFullYear();
+
+------------------------------------------------------------------
+FILE: /home/mac/dailybrief/app/(tabs)/reminders.tsx
+------------------------------------------------------------------
+55-    target.setMinutes(target.getMinutes() - offsetMinutes);
+56-  }
+57-  return {
+58:    date: target.toISOString().slice(0, 10),
+59-    time: `${String(target.getHours()).padStart(2, "0")}:${String(target.getMinutes()).padStart(2, "0")}`,
+60-  };
+61-}
+--
+122-
+123-  const confirmSnooze = async (minutes: number) => {
+124-    if (!snoozeTarget) return;
+125:    const until = new Date(Date.now() + minutes * 60000).toISOString();
+126-    await db.snoozeReminder(snoozeTarget.id, until);
+127-    setSnoozeTarget(null);
+128-    load();
+
+------------------------------------------------------------------
+FILE: /home/mac/dailybrief/app/brief.tsx
+------------------------------------------------------------------
+26-import * as tts from "@/lib/tts";
+27-import type { BriefMode } from "@/lib/types";
+28-
+29:// Local YYYY-MM-DD — never use toISOString() for date-only values: it reads UTC,
+30-// which drifts a day off near midnight in timezones ahead of UTC (e.g. Nairobi, UTC+3).
+31-function toLocalISODate(d: Date): string {
+32-  const y = d.getFullYear();
+--
+195-        if (params.kind === "reminder" && params.id) {
+196-          const parsedId = parseInt(params.id, 10);
+197-          if (!Number.isNaN(parsedId)) {
+198:            const until = new Date(Date.now() + minutes * 60000).toISOString();
+199-            await db.snoozeReminder(parsedId, until);
+200-          }
+201-        }
+
+------------------------------------------------------------------
+FILE: /home/mac/dailybrief/app/capture.tsx
+------------------------------------------------------------------
+46-const SCREEN_HEIGHT = Dimensions.get("window").height;
+47-const COMPOSER_LIFT = Math.round(SCREEN_HEIGHT * 0.01);
+48-
+49:// Local YYYY-MM-DD — never use toISOString() for date-only values: it reads UTC,
+50-// which drifts a day off near midnight in timezones ahead of UTC (e.g. Nairobi, UTC+3).
+51-function toLocalISODate(d: Date): string {
+52-  const y = d.getFullYear();
+
+==================================================================
+ SUMMARY: 19 occurrence(s) across 9 file(s)
+==================================================================

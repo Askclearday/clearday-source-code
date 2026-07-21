@@ -1,0 +1,2140 @@
+// Capture screen — voice OR text input, structured by Groq into a note/calendar/reminder.
+// Reachable from the FAB, from a tab's FAB, or from the overlay's "Add" button.
+// Query params:
+//   - type: "note" | "calendar_event" | "reminder" | undefined (hint, not forced)
+//   - from: "brief" | "overlay" | undefined
+//   - editId / editData: present when opened from Reminders' or Calendar's edit button —
+//     editData is the URI-encoded JSON of the RAW capture being edited:
+//       reminder:       { id, raw_input, due_date, due_time }
+//       calendar_event: { id, raw_input, date, time }
+//     We prefill the composer with raw_input (plus the known date/time appended as a
+//     parenthetical hint) so re-structuring starts from what the user actually said,
+//     not from the already-AI-generated title/details.
+import React, { useEffect, useState, useCallback, useRef } from "react";
+import type { StructuredItem, Reminder, CalendarEvent, Note } from "@/lib/types";
+import {
+  View,
+  Text,
+  StyleSheet,
+  TextInput,
+  Pressable,
+  ActivityIndicator,
+  Alert,
+  Platform,
+  KeyboardAvoidingView,
+  ScrollView,
+  Animated,
+  Easing,
+  Dimensions,
+  Image,
+  Keyboard,
+} from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+import { LinearGradient } from "expo-linear-gradient";
+import { useRouter, useLocalSearchParams } from "expo-router";
+import { Mic, Type, Send, ChevronLeft, Sparkles, Check, AlertCircle, X, FileText, Bell, Calendar as CalendarIcon, WifiOff } from "lucide-react-native";
+import { Audio } from "expo-av";
+import * as Network from "expo-network";
+
+import Colors from "@/constants/colors";
+import { radii, spacing, typography } from "@/constants/theme";
+import * as groq from "@/lib/groq";
+import * as db from "@/lib/db";
+import * as perms from "@/lib/permissions";
+
+// Screen-relative sizing for the composer's resting position — lifts it off the very
+// bottom edge by ~3% of screen height so it doesn't feel glued to the bottom.
+const SCREEN_HEIGHT = Dimensions.get("window").height;
+const COMPOSER_LIFT = Math.round(SCREEN_HEIGHT * 0.01);
+
+// Local YYYY-MM-DD — never use toISOString() for date-only values: it reads UTC,
+// which drifts a day off near midnight in timezones ahead of UTC (e.g. Nairobi, UTC+3).
+function toLocalISODate(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+// ----------------- OFFLINE MANUAL-ENTRY PARSING -----------------
+// Strict on purpose: offline entries have no AI follow-up to fall back on, so date/time must be
+// unambiguous the moment the user submits. Time must be exactly "H:MM" or "HH:MM" (1-12) with an
+// explicit AM/PM toggle, never a bare guessable hour like the AI path allows.
+function parseOfflineTime(timeText: string, ampm: "AM" | "PM"): string | null {
+  const m = timeText.trim().match(/^([0-9]{1,2}):([0-9]{2})$/);
+  if (!m) return null;
+  let h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  if (h < 1 || h > 12 || min < 0 || min > 59) return null;
+  if (ampm === "AM") h = h === 12 ? 0 : h;
+  else h = h === 12 ? 12 : h + 12;
+  return `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+}
+
+function resolveOfflineDate(choice: "today" | "tomorrow" | "custom", customDate: string): string | null {
+  const now = new Date();
+  if (choice === "today") return toLocalISODate(now);
+  if (choice === "tomorrow") {
+    const t = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    return toLocalISODate(t);
+  }
+  const trimmed = customDate.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+// ----------------- SMART / FORGIVING FORMATTING (offline manual entry) -----------------
+// These auto-restructure whatever the user types AS they type it — the user never has to
+// type the colon or the dashes themselves. Digits are read right-to-left into hour/minute
+// (time) or left-to-right into year/month/day (date), the same trick expiry-date inputs
+// use, so a half-typed value never looks "wrong" mid-entry. Both the on-screen text and the
+// value that eventually gets persisted go through this — there's no separate "raw" value
+// floating around that could get saved unformatted.
+
+// Last 2 digits typed are always the minutes; whatever's left in front is the hour. This
+// means "644" -> "6:44" and "1230" -> "12:30" resolve correctly without the user ever
+// picking which digits mean what.
+function formatTimeDigits(raw: string): string {
+  const digits = raw.replace(/\D/g, "").slice(0, 4);
+  if (digits.length === 0) return "";
+  if (digits.length <= 2) return digits; // still entering the hour — no colon yet
+  const hourPart = digits.slice(0, digits.length - 2);
+  const minutePart = digits.slice(-2);
+  let hourNum = parseInt(hourPart, 10);
+  if (Number.isNaN(hourNum)) hourNum = 0;
+  hourNum = Math.min(Math.max(hourNum, 1), 12);
+  let minNum = parseInt(minutePart, 10);
+  if (Number.isNaN(minNum)) minNum = 0;
+  minNum = Math.min(minNum, 59);
+  return `${hourNum}:${String(minNum).padStart(2, "0")}`;
+}
+
+// Lenient day cap per month (Feb kept at 29 rather than tracking leap years — this only
+// exists to stop wildly invalid days like "40", not to be a full calendar).
+const DAYS_IN_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+// Digits typed fill in YYYY, then MM, then DD, dashes inserted automatically as each
+// segment completes. Month/day are clamped into range only once fully typed, so a lone
+// "1" (which could become "01" through "19") isn't prematurely forced to "01".
+function formatDateDigits(raw: string): string {
+  const digits = raw.replace(/\D/g, "").slice(0, 8);
+  if (digits.length <= 4) return digits;
+  if (digits.length <= 6) {
+    const year = digits.slice(0, 4);
+    const monthDigits = digits.slice(4, 6);
+    return `${year}-${monthDigits}`;
+  }
+  const year = digits.slice(0, 4);
+  const monthDigits = digits.slice(4, 6);
+  const dayDigits = digits.slice(6, 8);
+  const month = Math.min(Math.max(parseInt(monthDigits, 10) || 1, 1), 12);
+  const maxDay = DAYS_IN_MONTH[month - 1] ?? 31;
+  const day = Math.min(Math.max(parseInt(dayDigits, 10) || 1, 1), maxDay);
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// Plain string-based preview formatter (no Date object) — avoids any timezone drift since
+// there's no time component to a date-only value.
+function formatPreviewDate(iso: string): string {
+  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return "";
+  const month = MONTH_NAMES[parseInt(m[2], 10) - 1] ?? "";
+  return `${month} ${parseInt(m[3], 10)}, ${m[1]}`;
+}
+
+// expo-av Audio recording permission request
+async function ensureMicPermission(): Promise<boolean> {
+  try {
+    const { status } = await Audio.requestPermissionsAsync();
+    return status === "granted";
+  } catch {
+    return false;
+  }
+}
+
+function formatTime(t: string): string {
+  const [hStr, mStr] = t.split(":");
+  const h = parseInt(hStr, 10);
+  const ampm = h >= 12 ? "PM" : "AM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${mStr?.padStart(2, "0") ?? "00"} ${ampm}`;
+}
+
+// Current time as 24h "HH:MM", anchoring point for the structuring prompt's relative-duration
+// math ("in 30 minutes", "within an hour", etc.) — without this the model has no idea what "now" is.
+function getCurrentTimeHHMM(): string {
+  const now = new Date();
+  return `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+}
+
+// If a resolved date/time falls on today but that time has already passed,
+// it can't mean today — bump it to tomorrow. Applies to reminders and
+// calendar events, whose date+time are both "future moments" by definition.
+function rollDateIfAlreadyPast(date: string | null, time: string | null): string | null {
+  if (!date || !time) return date;
+  const now = new Date();
+  const todayISO = toLocalISODate(now);
+  if (date !== todayISO) return date;
+
+  const [hStr, mStr] = time.split(":");
+  const timeMinutes = parseInt(hStr, 10) * 60 + parseInt(mStr, 10);
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+
+  if (timeMinutes <= nowMinutes) {
+    const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    return toLocalISODate(tomorrow);
+  }
+  return date;
+}
+
+// Subtracts `offsetMinutes` from date+time to get the moment the PRE-reminder should fire.
+// Returns null if there's no time to offset from, meaning "just use the due time directly."
+function computeOffsetDateTime(
+  date: string | null,
+  time: string | null,
+  offsetMinutes: number | null
+): { date: string; time: string } | null {
+  if (!date || !time || !offsetMinutes) return null;
+  const target = new Date(`${date}T${time}:00`);
+  target.setMinutes(target.getMinutes() - offsetMinutes);
+  return {
+    date: toLocalISODate(target),
+    time: `${String(target.getHours()).padStart(2, "0")}:${String(target.getMinutes()).padStart(2, "0")}`,
+  };
+}
+
+// Regex used to detect "this new item is probably tied to an existing reminder/event" phrasing.
+// Kept in sync with the connector phrasing resolveRelatedTime's prompt is told to treat as
+// equivalent — "while" and "during" etc. must all trigger this the same way.
+const RELATIONAL_WORDS =
+  /\bduring\b|\bwhile\b|\bafter my\b|\bbefore my\b|\bin the middle of\b|\bas part of\b|\bright after\b|\bright before\b/i;
+const RELATIONAL_KEYWORD_MATCH =
+  /(?:during|while|after my|before my|in the middle of|as part of|right after|right before)\s+(?:my\s+)?(\w+)/i;
+
+// A plain substring/keyword DB search is fragile to word form: a reminder titled "walk" won't be
+// found by searching "walking". Generate a small set of stems/variants of the captured word so we
+// search for all the forms that plausibly refer to the same thing, in both directions.
+function buildKeywordVariants(word: string): string[] {
+  const w = word.toLowerCase();
+  const variants = new Set<string>([w]);
+
+  if (w.endsWith("ing") && w.length > 4) {
+    variants.add(w.slice(0, -3)); // "walking" -> "walk"
+    variants.add(w.slice(0, -3) + "e"); // "hiking" -> "hike"
+  }
+  if (w.endsWith("ed") && w.length > 3) {
+    variants.add(w.slice(0, -2)); // "walked" -> "walk"
+    variants.add(w.slice(0, -1)); // "biked" -> "bik" (harmless extra guess)
+  }
+  if (w.endsWith("s") && w.length > 3) {
+    variants.add(w.slice(0, -1)); // "errands" -> "errand"
+  }
+  // Reverse direction, in case the captured word is the root and the stored title is longer.
+  variants.add(w + "ing");
+  variants.add(w + "s");
+
+  return Array.from(variants);
+}
+
+type CaptureState = "idle" | "recording" | "transcribing" | "structuring" | "confirming" | "saved";
+
+// Three staggered rings expanding + fading from a solid core — the "capture is listening"
+// indicator that renders above the composer while the mic is held.
+function PulseRings() {
+  const anims = useRef([new Animated.Value(0), new Animated.Value(0), new Animated.Value(0)]).current;
+
+  useEffect(() => {
+    const loops = anims.map((av, i) =>
+      Animated.loop(
+        Animated.sequence([
+          Animated.delay(i * 420),
+          Animated.timing(av, {
+            toValue: 1,
+            duration: 1500,
+            easing: Easing.out(Easing.ease),
+            useNativeDriver: true,
+          }),
+          Animated.timing(av, { toValue: 0, duration: 0, useNativeDriver: true }),
+          Animated.delay(2 * 420 - i * 420),
+        ])
+      )
+    );
+    loops.forEach((l) => l.start());
+    return () => loops.forEach((l) => l.stop());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <View style={styles.pulseRingsBox} pointerEvents="none">
+      {anims.map((av, i) => {
+        const scale = av.interpolate({ inputRange: [0, 1], outputRange: [0.5, 2.4] });
+        const opacity = av.interpolate({ inputRange: [0, 0.6, 1], outputRange: [0.5, 0.16, 0] });
+        return <Animated.View key={i} style={[styles.pulseRing, { opacity, transform: [{ scale }] }]} />;
+      })}
+      <View style={styles.pulseCore}>
+        <Mic size={16} color="#fff" />
+      </View>
+    </View>
+  );
+}
+
+// Rotating set of lines shown under the logo before the user starts typing/speaking:
+// a time-aware greeting first, then a plain instruction, then a pool of concrete
+// examples — cycled so the empty state never feels static or generic.
+const CAPTURE_TIPS: string[] = [
+  "Remind me of my dinner date tomorrow evening",
+  "Remind me to call my dad in the afternoon",
+  "Remind me of my girlfriend's upcoming birthday",
+  "Remind me of my partner's upcoming anniversary",
+  "Remind me to submit my project before the deadline tomorrow at midnight",
+  "Remind me of my client meeting tomorrow at noon",
+  "Remind me to pick up groceries after work",
+  "New note — ideas for the weekend trip",
+  "New calendar event — team standup at 9 AM",
+  "Remind me to take my medication tonight at 4 PM",
+];
+
+// Time-of-day greeting. 4am–12pm reads as morning (so early risers at 3–4am still
+// get "morning"), 12–5pm afternoon, 5–9pm evening, otherwise night.
+function greetingMessage(userName: string | null): string {
+  const h = new Date().getHours();
+  let part: string;
+  if (h >= 4 && h < 12) part = "Speak or type anything to save it";
+  else if (h >= 12 && h < 17) part = "Speak or type anything to save it ";
+  else if (h >= 17 && h < 21) part = "Speak or type anything to save it ";
+  else part = "Speak or type anything to save it";
+  return userName ? `${part}, ${userName}` : part;
+}
+
+// Centered logo + rotating line (greeting -> instruction -> examples), shown in place
+// of the old static hint card whenever the user isn't editing an existing item.
+function CaptureIntro({ userName }: { userName: string | null }) {
+  const [index, setIndex] = useState(0);
+  const fade = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      Animated.timing(fade, { toValue: 0, duration: 300, useNativeDriver: true }).start(() => {
+        setIndex((i) => (i + 1) % (CAPTURE_TIPS.length + 1));
+        Animated.timing(fade, { toValue: 1, duration: 300, useNativeDriver: true }).start();
+      });
+    }, 10000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Index 0 is always the live greeting, recomputed with the latest userName
+  // on every render — it never gets stuck on the "no name yet" value from the
+  // instant the component first mounted, before the DB fetch resolved.
+  const message = index === 0 ? greetingMessage(userName) : CAPTURE_TIPS[index - 1];
+
+  return (
+    <View style={styles.introBox}>
+      <Image
+        source={require("@/assets/images/icon2.png")}
+        style={styles.introLogo}
+        resizeMode="contain"
+      />
+      <Animated.Text style={[styles.introText, { opacity: fade }]} numberOfLines={2}>
+        {message}
+      </Animated.Text>
+    </View>
+  );
+}
+
+export default function CaptureScreen() {
+  const router = useRouter();
+  const insets = useSafeAreaInsets();
+  const params = useLocalSearchParams<{ type?: string; from?: string; editId?: string; editData?: string }>();
+  const hintType = (params.type as StructuredItem["type"] | undefined) ?? undefined;
+
+  const [editType, setEditType] = useState<"note" | "calendar_event" | "reminder" | null>(null);
+  const editTypeRef = useRef<typeof editType>(null);
+  const [text, setText] = useState("");
+  const [state, setState] = useState<CaptureState>("idle");
+  const [structured, setStructured] = useState<StructuredItem | null>(null);
+  const [recording, setRecording] = useState<Audio.Recording | null>(null);
+  const [needsFollowup, setNeedsFollowup] = useState<string | null>(null);
+  const [followupAnswer, setFollowupAnswer] = useState("");
+  const [suggestedTimes, setSuggestedTimes] = useState<{ label: string; date: string; time: string }[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [editId, setEditId] = useState<number | null>(null);
+  const [userName, setUserName] = useState<string | null>(null);
+  const [keyboardVisible, setKeyboardVisible] = useState(false);
+
+  // OFFLINE MODE
+  // Determined ONCE, when the capture screen mounts — not continuously polled. If the device is
+  // offline at that moment, the flow switches to manual, non-AI entry: no recording, no free-text
+  // structuring, just an explicit type + title + date + time form. `null` = still checking.
+  // It can ALSO flip to true later, mid-session, if an AI call fails and a follow-up network
+  // check confirms the device actually lost connectivity — see checkAndFlipOffline below.
+  const [isOffline, setIsOffline] = useState<boolean | null>(null);
+  const [offlineType, setOfflineType] = useState<"note" | "reminder" | "calendar_event">("reminder");
+  const [offlineTitle, setOfflineTitle] = useState("");
+  const [offlineDetails, setOfflineDetails] = useState("");
+  const [offlineDateChoice, setOfflineDateChoice] = useState<"today" | "tomorrow" | "custom">("today");
+  const [offlineCustomDate, setOfflineCustomDate] = useState("");
+  const [offlineTimeText, setOfflineTimeText] = useState("");
+  const [offlineAmPm, setOfflineAmPm] = useState<"AM" | "PM">("PM");
+  const [offlineSaving, setOfflineSaving] = useState(false);
+  const [offlineFormError, setOfflineFormError] = useState<string | null>(null);
+  // Mirrors editId but read via .current inside callbacks, so a stale
+  // memoized closure (e.g. structureAndSave, which doesn't list `persist`
+  // as a dependency) still sees the real id instead of the null it had
+  // captured on first render.
+  const editIdRef = useRef<number | null>(null);
+  // Set during persist() when editing a calendar event that has a linked
+  // reminder (found via the OLD date+title, before the edit's new values
+  // overwrite it) — read by cloneCalendarEventAsReminder and by the
+  // collision-resolution callbacks below, so an edited event updates its
+  // existing linked reminder in place instead of spawning a duplicate.
+  const linkedReminderIdRef = useRef<number | null>(null);
+  const [collision, setCollision] = useState<{
+    newItem: StructuredItem;
+    conflictWith: { id: number; title: string; time: string | null };
+    message: string;
+  } | null>(null);
+
+  // Configure audio mode for recording
+  useEffect(() => {
+    (async () => {
+      try {
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: true,
+          playsInSilentModeIOS: true,
+        });
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      if (recording) {
+        recording.stopAndUnloadAsync().catch(() => {});
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Fetch the current user's name for the greeting line shown above the composer.
+  useEffect(() => {
+    (async () => {
+      try {
+        const user = await db.getUser();
+        setUserName(user?.name ?? null);
+      } catch {
+        /* ignore — greeting just falls back to no name */
+      }
+    })();
+  }, []);
+
+  // Determined ONCE, at the moment this screen mounts — offline-ness is a snapshot taken as the
+  // capture screen loads, not something that flips the UI mid-session on its own (it can only be
+  // flipped explicitly, by an actual failed network call — see checkAndFlipOffline).
+  useEffect(() => {
+    (async () => {
+      try {
+        const netState = await Network.getNetworkStateAsync();
+        const offline = !netState.isConnected || netState.isInternetReachable === false;
+        setIsOffline(offline);
+      } catch {
+        // Can't even determine network state — fail safe into offline mode rather than risk
+        // hanging on an AI call that has no real chance of succeeding.
+        setIsOffline(true);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (hintType === "note" || hintType === "reminder" || hintType === "calendar_event") {
+      setOfflineType(hintType);
+    }
+  }, [hintType]);
+
+  // The intro (icon + rotating line) should only ever show on a truly empty,
+  // idle composer — the moment the keyboard is up, it hides, and it stays
+  // hidden for as long as the keyboard is open.
+  useEffect(() => {
+    const showEvt = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const hideEvt = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
+    const showSub = Keyboard.addListener(showEvt, () => setKeyboardVisible(true));
+    const hideSub = Keyboard.addListener(hideEvt, () => setKeyboardVisible(false));
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
+
+  // If we were opened for editing, prefill the composer with the RAW input the item was
+  // originally created from — not the AI-parsed title/details — so re-structuring starts
+  // from what the user actually said. The known due date/time is appended as a parenthetical
+  // hint, since relative phrases ("tomorrow", "in an hour") were already resolved once and
+  // re-parsing raw text alone can't recover that resolution reliably.
+  useEffect(() => {
+    if (typeof params.editData !== "string") return;
+    const type = (params.type as "note" | "calendar_event" | "reminder" | undefined) ?? "reminder";
+    try {
+      const raw = decodeURIComponent(params.editData);
+      const parsed = JSON.parse(raw);
+
+      if (type === "calendar_event") {
+        setEditId(parsed.id);
+        editIdRef.current = parsed.id;
+        setEditType("calendar_event");
+        editTypeRef.current = "calendar_event";
+
+        if ("raw_input" in parsed) {
+          let t = parsed.raw_input || "";
+          const when = [parsed.date ?? "", parsed.time ? `at ${formatTime(parsed.time)}` : ""]
+            .filter(Boolean)
+            .join(" ");
+          if (when) t += ` (on ${when})`;
+          setText(t);
+        } else {
+          // Legacy fallback for payloads that still send the full AI-parsed item.
+          const item: CalendarEvent = parsed;
+          const bits = [item.title];
+          if (item.details) bits.push(item.details);
+          let t = bits.join(" — ");
+          const when = [item.date ?? "", item.time ? `at ${formatTime(item.time)}` : ""]
+            .filter(Boolean)
+            .join(" ");
+          if (when) t += ` (on ${when})`;
+          setText(t);
+        }
+      } else if (type === "note") {
+        setEditId(parsed.id);
+        editIdRef.current = parsed.id;
+        setEditType("note");
+        editTypeRef.current = "note";
+
+        if ("raw_input" in parsed) {
+          setText(parsed.raw_input || "");
+        } else {
+          // Legacy fallback for payloads that still send the full AI-parsed item.
+          const item: Note = parsed;
+          const bits = [item.title];
+          if (item.content) bits.push(item.content);
+          setText(bits.join(" — "));
+        }
+      } else {
+        setEditId(parsed.id);
+        editIdRef.current = parsed.id;
+        setEditType("reminder");
+        editTypeRef.current = "reminder";
+
+        if ("raw_input" in parsed) {
+          let t = parsed.raw_input || "";
+          const when = [parsed.due_date ?? "", parsed.due_time ? `at ${formatTime(parsed.due_time)}` : ""]
+            .filter(Boolean)
+            .join(" ");
+          if (when) t += ` (due ${when})`;
+          setText(t);
+        } else {
+          // Legacy fallback for payloads that still send the full AI-parsed item.
+          const item: Reminder = parsed;
+          const bits = [item.title];
+          if (item.details) bits.push(item.details);
+          let t = bits.join(" — ");
+          if (item.due_date || item.due_time) {
+            const when = [item.due_date ?? "", item.due_time ? `at ${formatTime(item.due_time)}` : ""]
+              .filter(Boolean)
+              .join(" ");
+            t += ` (due ${when})`;
+          }
+          setText(t);
+        }
+      }
+    } catch (e) {
+      console.warn("[capture] failed to parse editData", e);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const startRecording = useCallback(async () => {
+    if (isOffline) return; // no mic while offline — nothing to transcribe against anyway
+    setError(null);
+    const ok = await ensureMicPermission();
+    if (!ok) {
+      Alert.alert("Microphone needed", "Grant microphone access in settings to capture by voice.");
+      return;
+    }
+    try {
+      setState("recording");
+      const rec = new Audio.Recording();
+      await rec.prepareToRecordAsync(Audio.RecordingOptionsPresets.HighQuality);
+      await rec.startAsync();
+      setRecording(rec);
+    } catch (e) {
+      console.warn("[capture] recording failed", e);
+      setError("Couldn't start recording. Try typing instead.");
+      setState("idle");
+    }
+  }, [isOffline]);
+
+  const stopAndTranscribe = useCallback(async () => {
+    if (!recording) return;
+    setState("transcribing");
+    try {
+      await recording.stopAndUnloadAsync();
+      const uri = recording.getURI();
+      setRecording(null);
+      if (!uri) {
+        setError("Recording failed — no audio captured.");
+        setState("idle");
+        return;
+      }
+      const transcript = await transcribeAudio(uri);
+      if (!transcript || transcript.trim().length === 0) {
+        setError("Couldn't hear you clearly — please type what you wanted to say.");
+        setState("idle");
+        return;
+      }
+      setText(transcript);
+      await structureAndSave(transcript);
+    } catch (e) {
+      console.warn("[capture] transcribe failed", e);
+      setError("Transcription failed. Type what you wanted to say.");
+      setState("idle");
+    }
+  }, [recording]);
+
+  const transcribeAudio = async (_uri: string): Promise<string | null> => {
+    return null;
+  };
+
+  // Re-checks real network state and, if the device has actually lost connectivity, flips
+  // isOffline to true so every subsequent call in this session takes the offline branch.
+  // Called from AI-call failure paths — a failure alone doesn't mean "offline" (could be a
+  // bad response, a timeout, a server error), so we only flip when the network check itself
+  // confirms it.
+  const checkAndFlipOffline = useCallback(async (): Promise<boolean> => {
+    try {
+      const netState = await Network.getNetworkStateAsync();
+      const offlineNow = !netState.isConnected || netState.isInternetReachable === false;
+      if (offlineNow) setIsOffline(true);
+      return offlineNow;
+    } catch {
+      setIsOffline(true);
+      return true;
+    }
+  }, []);
+
+  // Used at the two main entry points (structuring, persisting): if the failure turns out to
+  // be a real connectivity drop, flip into offline mode, carry over whatever the user had
+  // typed into the manual form's title so nothing is lost, and drop straight into the manual
+  // sheet instead of showing a dead-end error message.
+  const handlePossibleNetworkFailure = useCallback(
+    async (raw: string): Promise<boolean> => {
+      const offlineNow = await checkAndFlipOffline();
+      if (offlineNow) {
+        setOfflineTitle((prev) => prev || raw);
+        setError(null);
+        setState("idle");
+      }
+      return offlineNow;
+    },
+    [checkAndFlipOffline]
+  );
+
+  // Inserts a reminder cloned from a just-saved calendar event. We don't have a standalone
+  // calendar-notification path, so every calendar event also becomes a reminder — that's what
+  // actually drives the push notification. `rawInput` is stored on the clone too, so editing
+  // the clone later still starts from the original text.
+  //
+  // KNOWN LIMITATION: this clone isn't linked back to its parent calendar event (no FK), so
+  // re-editing a calendar event that was already cloned will produce a second, separate
+  // reminder rather than updating the first. Fixing that needs a schema change (e.g. a
+  // `source_calendar_event_id` column on reminders) — flagging for the next db.ts pass.
+  const cloneCalendarEventAsReminder = useCallback(async (item: StructuredItem, rawInput: string, existingReminderId?: number) => {
+    if (!item.date) return; // nothing to schedule a reminder against
+    try {
+      const currentUser = await db.getUser();
+      const userNameLocal = currentUser?.name ?? "there";
+      const offsetMinutes = item.reminder_offset_minutes ?? null;
+      const preReminderDateTime = computeOffsetDateTime(item.date, item.time, offsetMinutes);
+
+      // If this event has an existing linked reminder (found by the caller
+      // via the event's OLD date+title before this edit), update it in
+      // place instead of inserting a duplicate. NOTE: this reschedules a
+      // new notification at the updated time but doesn't cancel whatever
+      // was previously scheduled for the old time — there's no stored
+      // notification identifier on the reminder row to cancel by. Same
+      // pre-existing limitation as editing a reminder directly; worth a
+      // schema addition (a notification id column) if stray old
+      // notifications turn out to be a problem in practice.
+      let id: number;
+      if (existingReminderId) {
+        id = existingReminderId;
+        await db.updateReminderFields(id, {
+          title: item.title,
+          details: item.details || null,
+          due_date: item.date,
+          due_time: item.time,
+          time_range_end: item.time_range_end,
+          category: item.category,
+          recurrence: item.recurrence,
+          reminder_offset_minutes: offsetMinutes,
+          needs_confirmation: item.needs_confirmation ?? false,
+          raw_input: rawInput,
+        });
+      } else {
+        id = await db.insertReminder({
+          title: item.title,
+          details: item.details || null,
+          due_date: item.date,
+          due_time: item.time,
+          time_range_end: item.time_range_end,
+          category: item.category,
+          recurrence: item.recurrence,
+          reminder_offset_minutes: offsetMinutes,
+          needs_confirmation: item.needs_confirmation ?? false,
+          raw_input: rawInput,
+        });
+      }
+
+      if (item.date && item.time) {
+        const notificationText = isOffline
+          ? groq.offlineReminderNotificationText(userNameLocal, item.title, item.time)
+          : await groq.generateReminderNotification(userNameLocal, {
+              title: item.title,
+              details: item.details || null,
+              due_time: item.time,
+            });
+        await db.updateReminderNotificationText(id, notificationText);
+
+        try {
+          if (preReminderDateTime) {
+            await perms.scheduleReminderNotification(
+              id,
+              notificationText,
+              preReminderDateTime.date,
+              preReminderDateTime.time
+            );
+          } else {
+            await perms.scheduleReminderNotification(id, notificationText, item.date, item.time);
+          }
+
+          // Confirmation follow-ups are AI-authored — skip offline (needs_confirmation is never
+          // set true from the manual offline form anyway).
+          if (item.needs_confirmation && !isOffline) {
+            const confirmationText = await groq.generateConfirmationText(userNameLocal, {
+              title: item.title,
+              offsetMinutes,
+            });
+            await perms.scheduleConfirmationNotification(id, confirmationText, item.date, item.time);
+          }
+        } catch {
+          /* notification may be denied */
+        }
+      }
+    } catch (e) {
+      console.warn("[capture] failed to clone calendar event as reminder", e);
+      // The parent item is already saved at this point, so we don't reset the UI — just make
+      // sure future calls in this session know to take the offline branch if this was in fact
+      // a connectivity drop.
+      await checkAndFlipOffline();
+    }
+  }, [isOffline, checkAndFlipOffline]);
+
+  const structureAndSave = useCallback(async (raw: string, extraFollowup?: string) => {
+    if (isOffline) {
+      setError("You're offline — use the manual entry form below instead of free text.");
+      return;
+    }
+    setState("structuring");
+    setError(null);
+    setNeedsFollowup(null);
+    setSuggestedTimes([]);
+    try {
+      const todayISO = toLocalISODate(new Date());
+
+      // Bulk path: only attempted on the FIRST pass of a fresh capture (never on a
+      // follow-up answer, and never while editing an existing item) — a single block of
+      // text may actually contain several distinct notes/reminders/events at once.
+      if (!extraFollowup && !editTypeRef.current) {
+        try {
+          const items = await groq.structureMultipleInputs(raw, todayISO, getCurrentTimeHHMM());
+          if (items.length > 1) {
+            for (const it of items) {
+              if (it.type === "reminder" || it.type === "calendar_event") {
+                it.date = rollDateIfAlreadyPast(it.date, it.time);
+                // If the model still left date/time null, fall back to its own suggested
+                // moment instead of leaving the item unresolved — bulk captures never show
+                // a follow-up card, so this is the only chance to fill it in sensibly.
+                const anyIt = it as any;
+                if ((it.date === null || it.time === null) && anyIt.suggested_date && anyIt.suggested_time) {
+                  it.date = anyIt.suggested_date;
+                  it.time = anyIt.suggested_time;
+                }
+              }
+              // Each item only gets the slice of the original text that actually produced it —
+              // never the whole ramble — so its raw_input stays scoped to just that part.
+              await persist(it, it.raw_input || raw);
+            }
+            setStructured(items[items.length - 1]);
+            setState("saved");
+            setText("");
+            return;
+          }
+        } catch (e) {
+          console.warn("[capture] bulk structuring failed, falling back to single-item", e);
+        }
+      }
+
+      const item = await groq.structureInput(raw, todayISO, getCurrentTimeHHMM());
+      if (hintType && item.type !== hintType) {
+        if (/unclear|gibberish|untitled/i.test(item.title)) {
+          item.type = hintType;
+        }
+      }
+
+      // A time that's already passed today can't mean today.
+      if (item.type === "reminder" || item.type === "calendar_event") {
+        item.date = rollDateIfAlreadyPast(item.date, item.time);
+      }
+
+      // Cross-reference: if this item has no date/time of its own but the phrasing sounds
+      // relational ("during my walk", "while I'm at the gym"), search existing reminders/
+      // calendar_events for a plausible match and derive a time from it.
+      if ((item.type === "reminder" || item.type === "calendar_event") && !item.time) {
+        if (RELATIONAL_WORDS.test(raw)) {
+          const keywordMatch = raw.match(RELATIONAL_KEYWORD_MATCH);
+          const rawKeyword = keywordMatch?.[1];
+          if (rawKeyword) {
+            // Search every plausible word-form variant ("walking" should also find "walk"),
+            // and merge/dedupe the results rather than relying on a single exact substring.
+            const variants = buildKeywordVariants(rawKeyword);
+            const candidateById = new Map<number, Reminder | CalendarEvent>();
+            for (const variant of variants) {
+              const found = await db.searchRemindersAndEventsByKeyword(variant);
+              for (const c of found) {
+                candidateById.set(c.id, c);
+              }
+            }
+            const candidates = Array.from(candidateById.values());
+            if (candidates.length > 0) {
+              const resolved = await groq.resolveRelatedTime(
+                raw,
+                candidates.map((c) => ({
+                  title: c.title,
+                  date: "date" in c ? c.date : c.due_date,
+                  time: "time" in c ? c.time : c.due_time,
+                  kind: "date" in c ? "calendar_event" : "reminder",
+                }))
+              );
+              if (resolved) {
+                item.date = resolved.date ?? item.date;
+                item.time = resolved.time ?? item.time;
+              }
+            }
+          }
+        }
+      }
+
+      // "Anywhere between X and Y" with no other cues: pick a sensible point inside the
+      // range rather than defaulting to the literal start.
+      if (item.time && item.time_range_end && /\bbetween\b|\bin between\b/i.test(raw)) {
+        item.time = await groq.pickTimeWithinRange(item.time, item.time_range_end);
+      }
+
+      if ((item.type === "reminder" || item.type === "calendar_event") && (item.date === null || item.time === null)) {
+        const anyItem = item as any;
+
+        // Don't interrupt with a question when the AI already has a sensible best-guess
+        // moment — meal windows, work-hour bundling, "call someone tonight" defaults, etc.
+        // Just use it and save; the user can always edit the item afterward if it's wrong.
+        if (anyItem.suggested_date && anyItem.suggested_time) {
+          item.date = anyItem.suggested_date;
+          item.time = anyItem.suggested_time;
+          await persist(item, raw);
+          return;
+        }
+
+        const missing: string[] = [];
+        if (item.date === null) missing.push("date");
+        if (item.time === null) missing.push("time");
+        setStructured(item);
+        setNeedsFollowup(`What ${missing.join(" and ")} should I set for "${item.title}"? (e.g. "tomorrow at 3pm")`);
+        setState("confirming");
+        groq
+          .suggestTimesForItem(item.title, item.details || null, todayISO, getCurrentTimeHHMM())
+          .then(setSuggestedTimes)
+          .catch(() => setSuggestedTimes([]));
+        if (extraFollowup) {
+          const combined = `${raw}. ${extraFollowup}`;
+          const item2 = await groq.structureInput(combined, todayISO, getCurrentTimeHHMM());
+          if (item2.type === "reminder" || item2.type === "calendar_event") {
+            item2.date = rollDateIfAlreadyPast(item2.date, item2.time);
+          }
+          if (item2.date || item2.time) {
+            setNeedsFollowup(null);
+            await persist(item2, raw);
+            return;
+          }
+        }
+        return;
+      }
+
+      await persist(item, raw);
+    } catch (e) {
+      console.warn("[capture] structuring failed", e);
+      // If we actually lost the network, don't dead-end on a generic error — drop straight
+      // into the manual offline sheet with whatever was typed carried over.
+      const wentOffline = await handlePossibleNetworkFailure(raw);
+      if (wentOffline) return;
+      const message = e instanceof Error && e.message === "MISSING_GROQ_KEY"
+        ? "AI capture isn't configured. Add EXPO_PUBLIC_GROQ_API_KEY to enable voice/text structuring."
+        : "Couldn't structure your input. Try again or type more clearly.";
+      setError(message);
+      setState("idle");
+    }
+  }, [hintType, isOffline, handlePossibleNetworkFailure]);
+
+  const persist = useCallback(async (item: StructuredItem, rawInput: string) => {
+    const source: "voice" | "text" = isOffline ? "text" : rawInput !== text ? "voice" : "text";
+
+    // If we're editing an existing item, remove the original row first. This
+    // both makes the save an in-place update rather than a duplicate, and
+    // means (for calendar events) the slot this event already occupies never
+    // counts as a "collision" against itself in the check below.
+    //
+    // Before deleting, snapshot the OLD row — its date/title is the identity
+    // its linked counterpart (reminder <-> calendar event) was matched
+    // under, and that identity may change as part of this very edit. Using
+    // the new values to search would fail to find the link.
+    let cascadeOldReminder: Reminder | null = null;
+    let cascadeOldEvent: CalendarEvent | null = null;
+    if (editTypeRef.current && editIdRef.current) {
+      const id = editIdRef.current;
+      const kind = editTypeRef.current;
+      editIdRef.current = null;
+      editTypeRef.current = null;
+      if (kind === "reminder") {
+        cascadeOldReminder = await db.getReminderById(id);
+        await db.deleteReminder(id);
+      } else if (kind === "calendar_event") {
+        cascadeOldEvent = await db.getCalendarEventById(id);
+        await db.deleteCalendarEvent(id);
+      } else if (kind === "note") {
+        await db.deleteNote(id);
+      }
+    }
+
+    try {
+      if (item.type === "note") {
+        await db.insertNote({
+          title: item.title,
+          content: item.details || rawInput,
+          source,
+          tags: null,
+          category: item.category,
+          event_date: item.date,
+          event_time: item.time,
+          raw_input: rawInput,
+        });
+      } else if (item.type === "calendar_event") {
+        const eventDate = item.date ?? toLocalISODate(new Date());
+        if (item.time) {
+          const existing = await db.getCalendarEventsForDate(eventDate);
+          const conflict = existing.find((e) => {
+            if (!e.time) return false;
+            return Math.abs(toMinutes(e.time) - toMinutes(item.time as string)) < 45;
+          });
+          if (conflict) {
+            const message = isOffline
+              ? groq.offlineCollisionMessage(conflict.title, conflict.time as string, item.title, item.time as string)
+              : await groq.generateCollisionMessage(
+                  { title: conflict.title, time: conflict.time as string },
+                  { title: item.title, time: item.time }
+                );
+            // Resolve the linked reminder now, before returning to wait on the
+            // user's collision choice — resolveCollisionKeepBoth/PickTime read
+            // it back off the ref once the user picks an option.
+            linkedReminderIdRef.current = cascadeOldEvent
+              ? (await db.findReminderLinkedToCalendarEvent(cascadeOldEvent.date, cascadeOldEvent.title))?.id ?? null
+              : null;
+            setCollision({ newItem: item, conflictWith: conflict, message });
+            setState("confirming");
+            return;
+          }
+        }
+        await db.insertCalendarEvent({
+          title: item.title,
+          details: item.details || null,
+          date: eventDate,
+          time: item.time,
+          time_range_end: item.time_range_end,
+          category: item.category,
+          recurrence: item.recurrence,
+          raw_input: rawInput,
+        });
+        // No standalone calendar-notification path yet — every calendar event is also
+        // cloned as a reminder, since that's what actually schedules the push notification.
+        // If this event had an existing linked reminder (found via its OLD
+        // date+title, since the edit above may have changed them), update
+        // it in place instead of creating a duplicate.
+        const linkedReminder = cascadeOldEvent
+          ? await db.findReminderLinkedToCalendarEvent(cascadeOldEvent.date, cascadeOldEvent.title)
+          : null;
+        await cloneCalendarEventAsReminder({ ...item, date: eventDate }, rawInput, linkedReminder?.id);
+      } else if (item.type === "reminder") {
+        const currentUser = await db.getUser();
+        const userNameLocal = currentUser?.name ?? "there";
+
+        // The pre-reminder fires `reminder_offset_minutes` before the real due time; the due
+        // time itself is only used again for the optional confirmation notification.
+        const preReminderDateTime = computeOffsetDateTime(item.date, item.time, item.reminder_offset_minutes);
+
+        const id = await db.insertReminder({
+          title: item.title,
+          details: item.details || null,
+          due_date: item.date,
+          due_time: item.time,
+          time_range_end: item.time_range_end,
+          category: item.category,
+          recurrence: item.recurrence,
+          reminder_offset_minutes: item.reminder_offset_minutes,
+          needs_confirmation: item.needs_confirmation,
+          raw_input: rawInput,
+        });
+
+        // If this reminder had an existing linked calendar event (found via
+        // its OLD due_date+title, since the edit above may have changed
+        // them), cascade the edit to it too instead of leaving it stale.
+        if (cascadeOldReminder?.due_date) {
+          const linkedEvent = await db.findCalendarEventLinkedToReminder(
+            cascadeOldReminder.due_date,
+            cascadeOldReminder.title
+          );
+          if (linkedEvent) {
+            await db.updateCalendarEventFields(linkedEvent.id, {
+              title: item.title,
+              details: item.details || null,
+              date: item.date ?? linkedEvent.date,
+              time: item.time,
+              time_range_end: item.time_range_end,
+              category: item.category,
+              recurrence: item.recurrence,
+              raw_input: rawInput,
+            });
+          }
+        }
+
+        if (item.date && item.time) {
+          const notificationText = isOffline
+            ? groq.offlineReminderNotificationText(userNameLocal, item.title, item.time)
+            : await groq.generateReminderNotification(userNameLocal, {
+                title: item.title,
+                details: item.details || null,
+                due_time: item.time,
+              });
+          await db.updateReminderNotificationText(id, notificationText);
+
+          try {
+            if (preReminderDateTime) {
+              await perms.scheduleReminderNotification(
+                id,
+                notificationText,
+                preReminderDateTime.date,
+                preReminderDateTime.time
+              );
+            } else {
+              await perms.scheduleReminderNotification(id, notificationText, item.date, item.time);
+            }
+
+            if (item.needs_confirmation && !isOffline) {
+              const confirmationText = await groq.generateConfirmationText(userNameLocal, {
+                title: item.title,
+                offsetMinutes: item.reminder_offset_minutes,
+              });
+              await perms.scheduleConfirmationNotification(id, confirmationText, item.date, item.time);
+            }
+          } catch {
+            /* notification may be denied */
+          }
+        }
+      }
+      setStructured(item);
+      setState("saved");
+      setText("");
+    } catch (e) {
+      console.warn("[capture] persist failed", e);
+      // Same policy as structureAndSave: a genuine connectivity drop drops us into the
+      // manual sheet instead of just showing "couldn't save."
+      const wentOffline = await handlePossibleNetworkFailure(rawInput);
+      if (wentOffline) return;
+      setError("Couldn't save. Please try again.");
+      setState("idle");
+    }
+  }, [text, cloneCalendarEventAsReminder, isOffline, handlePossibleNetworkFailure]); 
+
+  const resetOfflineForm = useCallback(() => {
+    setOfflineTitle("");
+    setOfflineDetails("");
+    setOfflineDateChoice("today");
+    setOfflineCustomDate("");
+    setOfflineTimeText("");
+    setOfflineAmPm("PM");
+    setOfflineFormError(null);
+  }, []);
+
+  // Auto-restructures every keystroke into "H:MM" — the user only ever types digits.
+  const onOfflineTimeChange = useCallback((val: string) => {
+    setOfflineTimeText(formatTimeDigits(val));
+  }, []);
+
+  // Auto-restructures every keystroke into "YYYY-MM-DD" — the user only ever types digits.
+  const onOfflineDateChange = useCallback((val: string) => {
+    setOfflineCustomDate(formatDateDigits(val));
+  }, []);
+
+  const onOfflineSubmit = useCallback(async () => {
+    setOfflineFormError(null);
+    const title = offlineTitle.trim();
+    if (!title) {
+      setOfflineFormError("Enter a title first.");
+      return;
+    }
+
+    if (offlineType === "note") {
+      setOfflineSaving(true);
+      const item: StructuredItem = {
+        type: "note",
+        title,
+        details: offlineDetails.trim(),
+        date: null,
+        time: null,
+        time_range_end: null,
+        recurring: false,
+        recurrence: "once",
+        category: "general",
+        reminder_offset_minutes: null,
+        needs_confirmation: false,
+      } as StructuredItem;
+      await persist(item, title);
+      setOfflineSaving(false);
+      resetOfflineForm();
+      return;
+    }
+
+    // reminder / calendar_event both require an explicit date + time offline — there's no AI
+    // follow-up to fall back on to resolve it later.
+    const date = resolveOfflineDate(offlineDateChoice, offlineCustomDate);
+    if (!date) {
+      setOfflineFormError("Enter the date — we'll format it as YYYY-MM-DD as you type.");
+      return;
+    }
+    const time = parseOfflineTime(offlineTimeText, offlineAmPm);
+    if (!time) {
+      setOfflineFormError('Enter the time — e.g. "644" becomes 6:44 — then pick AM or PM.');
+      return;
+    }
+
+    const item: StructuredItem = {
+      type: offlineType,
+      title,
+      details: offlineDetails.trim(),
+      date,
+      time,
+      time_range_end: null,
+      recurring: false,
+      recurrence: "once",
+      category: "general",
+      reminder_offset_minutes: offlineType === "reminder" ? 15 : null,
+      needs_confirmation: false,
+    } as StructuredItem;
+
+    setOfflineSaving(true);
+    await persist(item, title);
+    setOfflineSaving(false);
+    resetOfflineForm();
+  }, [
+    offlineType,
+    offlineTitle,
+    offlineDetails,
+    offlineDateChoice,
+    offlineCustomDate,
+    offlineTimeText,
+    offlineAmPm,
+    persist,
+    resetOfflineForm,
+  ]);
+
+  const onSendText = () => {
+    if (!text.trim()) return;
+    Keyboard.dismiss();
+    structureAndSave(text.trim());
+  };
+
+  const onSubmitFollowup = () => {
+    if (!followupAnswer.trim() || !structured) return;
+    structureAndSave(`${text} ${followupAnswer}`.trim(), followupAnswer.trim());
+  };
+
+  // Quick-pick buttons on the follow-up card: accept one of the AI's two suggested
+  // moments directly, or let the AI pick freely via "Any time".
+  const onPickSuggestedTime = useCallback(
+    async (suggestion: { date: string; time: string }) => {
+      if (!structured) return;
+      const finalItem: StructuredItem = { ...structured, date: suggestion.date, time: suggestion.time };
+      setNeedsFollowup(null);
+      setSuggestedTimes([]);
+      await persist(finalItem, text || structured.title);
+    },
+    [structured, text, persist]
+  );
+
+  const onPickAnyTime = useCallback(async () => {
+    if (!structured) return;
+    setNeedsFollowup(null);
+    setSuggestedTimes([]);
+    setFollowupAnswer("");
+
+    // Never re-run the structuring pipeline here — that's what caused "Any time" to loop
+    // back into asking for a time again. Resolve a real moment directly from data we
+    // already have: the item's own AI-suggested moment first, then the suggested-times
+    // card's first option, then a plain "30 minutes from now" default as a last resort.
+    const anyStructured = structured as any;
+    let finalDate: string | null = anyStructured.suggested_date ?? null;
+    let finalTime: string | null = anyStructured.suggested_time ?? null;
+
+    if ((!finalDate || !finalTime) && suggestedTimes.length > 0) {
+      finalDate = suggestedTimes[0].date;
+      finalTime = suggestedTimes[0].time;
+    }
+
+    if (!finalDate || !finalTime) {
+      const soon = new Date(Date.now() + 30 * 60 * 1000);
+      finalDate = toLocalISODate(soon);
+      finalTime = `${String(soon.getHours()).padStart(2, "0")}:${String(soon.getMinutes()).padStart(2, "0")}`;
+    }
+
+    const finalItem: StructuredItem = { ...structured, date: finalDate, time: finalTime };
+    await persist(finalItem, text || structured.title);
+  }, [structured, suggestedTimes, text, persist]);
+
+  const resolveCollisionKeepBoth = useCallback(async () => {
+    if (!collision) return;
+    const { newItem } = collision;
+    const eventDate = newItem.date ?? toLocalISODate(new Date());
+    await db.insertCalendarEvent({
+      title: newItem.title,
+      details: newItem.details || null,
+      date: eventDate,
+      time: newItem.time,
+      time_range_end: newItem.time_range_end,
+      category: newItem.category,
+      recurrence: newItem.recurrence,
+      raw_input: text,
+    });
+    await cloneCalendarEventAsReminder({ ...newItem, date: eventDate }, text, linkedReminderIdRef.current ?? undefined);
+    linkedReminderIdRef.current = null;
+    setStructured(newItem);
+    setCollision(null);
+    setState("saved");
+    setText("");
+  }, [collision, cloneCalendarEventAsReminder, text]);
+
+  const resolveCollisionPickTime = useCallback(async (minutesOffset: number) => {
+    if (!collision || !collision.newItem.time) return;
+    const shifted = shiftTime(collision.newItem.time, minutesOffset);
+    const updatedItem = { ...collision.newItem, time: shifted };
+    const eventDate = updatedItem.date ?? toLocalISODate(new Date());
+    await db.insertCalendarEvent({
+      title: updatedItem.title,
+      details: updatedItem.details || null,
+      date: eventDate,
+      time: updatedItem.time,
+      time_range_end: updatedItem.time_range_end,
+      category: updatedItem.category,
+      recurrence: updatedItem.recurrence,
+      raw_input: text,
+    });
+    await cloneCalendarEventAsReminder({ ...updatedItem, date: eventDate }, text, linkedReminderIdRef.current ?? undefined);
+    linkedReminderIdRef.current = null;
+    setStructured(updatedItem);
+    setCollision(null);
+    setState("saved");
+    setText("");
+  }, [collision, cloneCalendarEventAsReminder, text]);
+
+  // "Discard this one" — the user chooses to keep the existing item untouched and throw away
+  // the new one they were typing/dictating. Nothing is written to the DB; we just clear the
+  // composer and drop back to idle so they can start a fresh capture if they want.
+  const resolveCollisionDiscardNew = useCallback(() => {
+    setCollision(null);
+    setStructured(null);
+    setText("");
+    setState("idle");
+  }, []);
+
+  function shiftTime(hhmm: string, minutesOffset: number): string {
+    const total = Math.max(0, toMinutes(hhmm) + minutesOffset);
+    const h = Math.floor(total / 60) % 24;
+    const m = total % 60;
+    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+  }
+
+  const onClose = () => {
+    if (recording) {
+      recording.stopAndUnloadAsync().catch(() => {});
+    }
+    if (params.from === "brief") {
+      router.back();
+    } else {
+      router.back();
+    }
+  };
+
+  const confirmationLabel = structured ? confirmLabel(structured) : "";
+  // Locks the mic + send buttons while the AI is structuring/transcribing, so a second tap
+  // can't race the in-flight request. The text field itself stays editable throughout —
+  // typing doesn't touch the network, so there's nothing for it to race against.
+  const composerDisabled = state === "structuring" || state === "transcribing";
+  const showIntro =
+    isOffline === false &&
+    !editId &&
+    state === "idle" &&
+    !keyboardVisible &&
+    !text.trim() &&
+    !error &&
+    !collision &&
+    !needsFollowup;
+
+  // Live preview shown above the Save button in offline mode — resolved from whatever the
+  // user has typed so far, using the exact same resolvers the submit handler uses, so the
+  // preview never lies about what will actually be saved.
+  const offlinePreviewDateISO = resolveOfflineDate(offlineDateChoice, offlineCustomDate);
+  const offlinePreviewTime24 = parseOfflineTime(offlineTimeText, offlineAmPm);
+
+  return (
+    <View style={styles.flex}>
+      <SafeAreaView style={styles.flex} edges={["top", "bottom"]}>
+        <KeyboardAvoidingView
+          style={styles.flex}
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+          keyboardVerticalOffset={Platform.OS === "ios" ? insets.top + 56 : 0}
+        >
+          <View style={styles.header}>
+            <Pressable style={styles.closeBtn} onPress={onClose} hitSlop={8}>
+              <ChevronLeft size={24} color={Colors.light.ink} />
+            </Pressable>
+            <Text style={styles.headerTitle}>
+              {editId
+                ? `Edit ${editType === "calendar_event" ? "event" : editType === "note" ? "note" : "reminder"}`
+                : hintType
+                ? `New ${hintType.replace("_", " ")}`
+                : "Quick capture"}
+            </Text>
+            <View style={{ width: 40 }} />
+          </View>
+
+          {isOffline === true && (
+            <View style={styles.offlineBanner}>
+              <WifiOff size={14} color={Colors.light.warn} />
+              <Text style={styles.offlineBannerText}>Offline — manual entry only</Text>
+            </View>
+          )}
+
+          {/* Everything between the header and the composer bar. Positioned "relative" so the
+              structuring pill and the listening pulse can be centered as absolute overlays
+              within exactly this space, rather than getting shoved to wherever they happen
+              to fall in the scroll flow. */}
+          <View style={styles.contentArea}>
+            <ScrollView
+              contentContainerStyle={styles.body}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+            >
+              {editId && (
+                <View style={styles.hintCard}>
+                  <Text style={styles.hint}>Edit the details below, then send to update this item.</Text>
+                </View>
+              )}
+
+              {collision && state === "confirming" && (
+                <View style={styles.followupCard}>
+                  <View style={styles.followupHeader}>
+                    <AlertCircle size={16} color={Colors.light.warn} />
+                    <Text style={styles.followupTitle}>These two are close together</Text>
+                  </View>
+                  <Text style={styles.followupText}>{collision.message}</Text>
+                  <View style={styles.promptActionsRow}>
+                    <Pressable style={styles.collisionBtn} onPress={() => resolveCollisionPickTime(60)}>
+                      <Text style={styles.collisionBtnLabel}>Move new one 1hr later</Text>
+                    </Pressable>
+
+                    <Pressable style={styles.collisionBtn} onPress={resolveCollisionKeepBoth}>
+                      <Text style={styles.collisionBtnLabel}>Keep both as-is</Text>
+                    </Pressable>
+
+                    <Pressable style={styles.collisionBtn} onPress={() => resolveCollisionPickTime(-60)}>
+                      <Text style={styles.collisionBtnLabel}>Move new one 1hr earlier</Text>
+                    </Pressable>
+                   
+                    <Pressable style={styles.collisionBtn} onPress={resolveCollisionDiscardNew}>
+                      <Text style={styles.collisionBtnLabel}>Discard this one</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              )}
+
+              {needsFollowup && state === "confirming" && (
+                <View style={styles.followupCard}>
+                  <View style={styles.followupHeader}>
+                    <AlertCircle size={16} color={Colors.light.warn} />
+                    <Text style={styles.followupTitle}>One more thing</Text>
+                  </View>
+                  <Text style={styles.followupText}>{needsFollowup}</Text>
+                  <View style={styles.suggestedTimesRow}>
+                    <Pressable style={styles.suggestedTimeBtn} onPress={onPickAnyTime}>
+                      <Text style={styles.suggestedTimeBtnLabel}>Any time</Text>
+                    </Pressable>
+                    {suggestedTimes.map((s, i) => (
+                      <Pressable key={i} style={styles.suggestedTimeBtn} onPress={() => onPickSuggestedTime(s)}>
+                        <Text style={styles.suggestedTimeBtnLabel}>{s.label}</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                  <View style={styles.followupInputRow}>
+                    <TextInput
+                      value={followupAnswer}
+                      onChangeText={setFollowupAnswer}
+                      placeholder="e.g. tomorrow at 3 PM"
+                      placeholderTextColor={Colors.light.inkFaint}
+                      style={styles.followupInput}
+                      autoFocus
+                    />
+                    <Pressable
+                      style={[styles.followupSendBtn, !followupAnswer.trim() && styles.btnDisabled]}
+                      onPress={onSubmitFollowup}
+                      disabled={!followupAnswer.trim()}
+                    >
+                      <Send size={16} color="#fff" />
+                    </Pressable>
+                  </View>
+                </View>
+              )}
+
+              {error && (
+                <View style={styles.errorCard}>
+                  <AlertCircle size={16} color={Colors.light.danger} />
+                  <Text style={styles.errorText}>{error}</Text>
+                </View>
+              )}
+
+              {state === "saved" && structured && (
+                <View style={styles.savedCard}>
+                  <LinearGradient
+                    colors={[Colors.light.coral + "26", "transparent"]}
+                    start={{ x: 0, y: 0 }}
+                    end={{ x: 1, y: 1 }}
+                    style={styles.savedCardGlow}
+                  />
+                  <View style={styles.savedCheck}>
+                    <Check size={22} color={Colors.light.coral} />
+                  </View>
+                  <Text style={styles.savedTitle}>Got it</Text>
+                  <Text style={styles.savedText}>{confirmationLabel}</Text>
+                  <Pressable style={styles.savedDoneBtn} onPress={onClose}>
+                    <Text style={styles.savedDoneLabel}>Done</Text>
+                  </Pressable>
+                </View>
+              )}
+
+              {/* ---------------- OFFLINE MANUAL ENTRY (premium card) ---------------- */}
+              {isOffline === true && (
+                <View style={styles.offlineCard}>
+                  <LinearGradient
+                    colors={[Colors.light.coral + "26", "transparent"]}
+                    start={{ x: 0, y: 0 }}
+                    end={{ x: 1, y: 1 }}
+                    style={styles.offlineCardGlow}
+                  />
+
+                  <View style={styles.offlineCardHeader}>
+                    <View style={styles.offlineIconWrap}>
+                      <WifiOff size={16} color={Colors.light.coral} />
+                    </View>
+                    <Text style={styles.offlineEyebrow}>OFFLINE ENTRY</Text>
+                  </View>
+
+                  <View style={styles.offlineTypeRow}>
+                    <Pressable
+                      style={[styles.offlineTypeBtn, offlineType === "note" && styles.offlineTypeBtnActive]}
+                      onPress={() => setOfflineType("note")}
+                    >
+                      <FileText size={16} color={offlineType === "note" ? "#fff" : Colors.light.coralDeep} />
+                      <Text style={[styles.offlineTypeBtnLabel, offlineType === "note" && styles.offlineTypeBtnLabelActive]}>
+                        Note
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.offlineTypeBtn, offlineType === "reminder" && styles.offlineTypeBtnActive]}
+                      onPress={() => setOfflineType("reminder")}
+                    >
+                      <Bell size={16} color={offlineType === "reminder" ? "#fff" : Colors.light.coralDeep} />
+                      <Text
+                        style={[styles.offlineTypeBtnLabel, offlineType === "reminder" && styles.offlineTypeBtnLabelActive]}
+                      >
+                        Reminder
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.offlineTypeBtn, offlineType === "calendar_event" && styles.offlineTypeBtnActive]}
+                      onPress={() => setOfflineType("calendar_event")}
+                    >
+                      <CalendarIcon size={16} color={offlineType === "calendar_event" ? "#fff" : Colors.light.coralDeep} />
+                      <Text
+                        style={[
+                          styles.offlineTypeBtnLabel,
+                          offlineType === "calendar_event" && styles.offlineTypeBtnLabelActive,
+                        ]}
+                      >
+                        Event
+                      </Text>
+                    </Pressable>
+                  </View>
+
+                  <Text style={styles.offlineFieldLabel}>Title</Text>
+                  <TextInput
+                    value={offlineTitle}
+                    onChangeText={setOfflineTitle}
+                    placeholder={offlineType === "note" ? "What do you want to note down?" : "What should I remind you of?"}
+                    placeholderTextColor={Colors.light.inkFaint}
+                    style={styles.offlineInput}
+                  />
+
+                  <Text style={styles.offlineFieldLabel}>Details (optional)</Text>
+                  <TextInput
+                    value={offlineDetails}
+                    onChangeText={setOfflineDetails}
+                    placeholder="Anything else worth remembering"
+                    placeholderTextColor={Colors.light.inkFaint}
+                    style={[styles.offlineInput, styles.offlineInputMultiline]}
+                    multiline
+                  />
+
+                  {offlineType !== "note" && (
+                    <>
+                      <Text style={styles.offlineFieldLabel}>Date</Text>
+                      <View style={styles.offlineChoiceRow}>
+                        <Pressable
+                          style={[styles.offlineChoiceBtn, offlineDateChoice === "today" && styles.offlineChoiceBtnActive]}
+                          onPress={() => setOfflineDateChoice("today")}
+                        >
+                          <Text
+                            style={[styles.offlineChoiceLabel, offlineDateChoice === "today" && styles.offlineChoiceLabelActive]}
+                          >
+                            Today
+                          </Text>
+                        </Pressable>
+                        <Pressable
+                          style={[styles.offlineChoiceBtn, offlineDateChoice === "tomorrow" && styles.offlineChoiceBtnActive]}
+                          onPress={() => setOfflineDateChoice("tomorrow")}
+                        >
+                          <Text
+                            style={[
+                              styles.offlineChoiceLabel,
+                              offlineDateChoice === "tomorrow" && styles.offlineChoiceLabelActive,
+                            ]}
+                          >
+                            Tomorrow
+                          </Text>
+                        </Pressable>
+                        <Pressable
+                          style={[styles.offlineChoiceBtn, offlineDateChoice === "custom" && styles.offlineChoiceBtnActive]}
+                          onPress={() => setOfflineDateChoice("custom")}
+                        >
+                          <Text
+                            style={[
+                              styles.offlineChoiceLabel,
+                              offlineDateChoice === "custom" && styles.offlineChoiceLabelActive,
+                            ]}
+                          >
+                            Custom
+                          </Text>
+                        </Pressable>
+                      </View>
+                      {offlineDateChoice === "custom" && (
+                        <>
+                          <TextInput
+                            value={offlineCustomDate}
+                            onChangeText={onOfflineDateChange}
+                            placeholder="e.g. 20260718"
+                            placeholderTextColor={Colors.light.inkFaint}
+                            style={styles.offlineInput}
+                            keyboardType="number-pad"
+                            maxLength={10}
+                          />
+                          <Text style={styles.offlineHelperText}>Just type digits — we'll format it as YYYY-MM-DD.</Text>
+                        </>
+                      )}
+
+                      <Text style={styles.offlineFieldLabel}>Time</Text>
+                      <View style={styles.offlineTimeRow}>
+                        <TextInput
+                          value={offlineTimeText}
+                          onChangeText={onOfflineTimeChange}
+                          placeholder="e.g. 644"
+                          placeholderTextColor={Colors.light.inkFaint}
+                          style={[styles.offlineInput, styles.offlineTimeInput]}
+                          keyboardType="number-pad"
+                          maxLength={5}
+                        />
+                        <View style={styles.offlineAmPmGroup}>
+                          <Pressable
+                            style={[styles.offlineAmPmBtn, offlineAmPm === "AM" && styles.offlineAmPmBtnActive]}
+                            onPress={() => setOfflineAmPm("AM")}
+                          >
+                            <Text style={[styles.offlineAmPmLabel, offlineAmPm === "AM" && styles.offlineAmPmLabelActive]}>
+                              AM
+                            </Text>
+                          </Pressable>
+                          <Pressable
+                            style={[styles.offlineAmPmBtn, offlineAmPm === "PM" && styles.offlineAmPmBtnActive]}
+                            onPress={() => setOfflineAmPm("PM")}
+                          >
+                            <Text style={[styles.offlineAmPmLabel, offlineAmPm === "PM" && styles.offlineAmPmLabelActive]}>
+                              PM
+                            </Text>
+                          </Pressable>
+                        </View>
+                      </View>
+                      <Text style={styles.offlineHelperText}>Just type digits — we'll format it for you.</Text>
+
+                      <View style={styles.offlinePreviewPill}>
+                        <Text style={styles.offlinePreviewText}>
+                          {offlinePreviewDateISO ? formatPreviewDate(offlinePreviewDateISO) : "Pick a date"}
+                          {"  ·  "}
+                          {offlinePreviewTime24 ? formatTime(offlinePreviewTime24) : "Set a time"}
+                        </Text>
+                      </View>
+                    </>
+                  )}
+
+                  {offlineFormError && (
+                    <View style={styles.offlineErrorRow}>
+                      <AlertCircle size={14} color={Colors.light.danger} />
+                      <Text style={styles.offlineFormErrorText}>{offlineFormError}</Text>
+                    </View>
+                  )}
+
+                  <Pressable
+                    style={[styles.offlineSubmitBtn, (!offlineTitle.trim() || offlineSaving) && styles.btnDisabled]}
+                    onPress={onOfflineSubmit}
+                    disabled={!offlineTitle.trim() || offlineSaving}
+                  >
+                    {offlineSaving ? (
+                      <ActivityIndicator size="small" color="#fff" />
+                    ) : (
+                      <>
+                        <Send size={16} color="#fff" />
+                        <Text style={styles.offlineSubmitLabel}>
+                          Save {offlineType === "note" ? "note" : offlineType === "reminder" ? "reminder" : "event"}
+                        </Text>
+                      </>
+                    )}
+                  </Pressable>
+                </View>
+              )}
+            </ScrollView>
+
+            {showIntro && (
+              <View style={styles.centerOverlay} pointerEvents="none">
+                <CaptureIntro userName={userName} />
+              </View>
+            )}
+
+            {/* Centered in the space above the composer, not pinned to the bottom of it. */}
+            {state === "structuring" && (
+              <View style={styles.centerOverlay} pointerEvents="none">
+                <View style={styles.structuringPill}>
+                  <Sparkles size={16} color={Colors.light.coral} />
+                  <Text style={styles.structuringPillText}>Structuring with AI…</Text>
+                </View>
+              </View>
+            )}
+
+            {state === "recording" && (
+              <View style={styles.centerOverlay} pointerEvents="none">
+                <PulseRings />
+                <Text style={styles.pulseLabel}>Listening… release to send</Text>
+              </View>
+            )}
+          </View>
+
+          {isOffline === null && (
+            <View style={styles.offlineCheckingBox}>
+              <ActivityIndicator size="small" color={Colors.light.coral} />
+            </View>
+          )}
+
+          {isOffline === false && (
+            <View style={styles.composerOuter}>
+              <View style={styles.composerBar}>
+                <TextInput
+                  value={text}
+                  onChangeText={setText}
+                  placeholder="Add New Reminders"
+                  placeholderTextColor={Colors.light.inkFaint}
+                  style={styles.composerInput}
+                  multiline
+                  editable={state !== "transcribing"}
+                />
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.composerMicBtn,
+                    state === "recording" && styles.composerMicBtnActive,
+                    pressed && !composerDisabled && { opacity: 0.85 },
+                  ]}
+                  onPressIn={startRecording}
+                  onPressOut={stopAndTranscribe}
+                  disabled={composerDisabled}
+                  hitSlop={4}
+                >
+                  {state === "transcribing" ? (
+                    <ActivityIndicator size="small" color={Colors.light.coral} />
+                  ) : (
+                    <Mic size={18} color={state === "recording" ? "#fff" : "#fff"}/>
+                  )}
+                </Pressable>
+                <Pressable
+                  style={[styles.composerSendBtn, (!text.trim() || composerDisabled) && styles.btnDisabled]}
+                  onPress={onSendText}
+                  disabled={!text.trim() || composerDisabled}
+                  hitSlop={4}
+                >
+                  {state === "structuring" ? (
+                    <ActivityIndicator size="small" color="#fff" />
+                  ) : (
+                    <Send size={17} color="#fff" />
+                  )}
+                </Pressable>
+              </View>
+            </View>
+          )}
+        </KeyboardAvoidingView>
+      </SafeAreaView>
+    </View>
+  );
+}
+
+function toMinutes(hhmm: string): number {
+  const [h, m] = hhmm.split(":").map((x) => parseInt(x, 10));
+  return h * 60 + m;
+}
+
+function confirmLabel(item: StructuredItem): string {
+  const typeLabel = item.type === "calendar_event" ? "calendar event" : item.type;
+  const when =
+    item.type === "note"
+      ? ""
+      : item.date && item.time
+        ? ` for ${item.date} at ${item.time}`
+        : item.date
+          ? ` for ${item.date}`
+          : item.time
+            ? ` at ${item.time}`
+            : "";
+  const reminderNote = item.type === "calendar_event" ? " A reminder was set for it too." : "";
+  return `Saved as a ${typeLabel}: "${item.title}"${when}.${reminderNote}`;
+}
+
+const styles = StyleSheet.create({
+  flex: { flex: 1, backgroundColor: Colors.light.cream },
+
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+  },
+  closeBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: Colors.light.surface,
+    borderWidth: 1,
+    borderColor: Colors.light.border,
+  },
+  headerTitle: { fontSize: 17, fontWeight: "700", color: Colors.light.ink },
+
+  // Wraps the scrollable body + the centered overlays that render on top of it
+  // (structuring pill, listening pulse). `position: relative` is what lets those
+  // overlays use `position: absolute` to fill and center within exactly this space.
+  contentArea: { flex: 1, position: "relative" },
+
+  body: { padding: spacing.lg, paddingTop: spacing.md, paddingBottom: spacing.lg, gap: spacing.sm },
+
+  hintCard: {
+    backgroundColor: Colors.light.surface,
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    borderColor: Colors.light.border,
+    padding: spacing.md,
+  },
+  hint: { fontSize: 14, color: Colors.light.inkMuted, lineHeight: 20 },
+
+  // Centered logo + rotating greeting/instruction/example line, shown instead of the
+  // static hint card whenever the user isn't editing an existing item.
+  introBox: {
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: spacing.xl,
+    gap: spacing.md,
+  },
+  introLogo: {
+    width: 80,
+    height: 80,
+  },
+  introText: {
+    fontSize: 20,
+    fontWeight: "700",
+    color: Colors.light.inkMuted,
+    textAlign: "center",
+    lineHeight: 28,
+    paddingHorizontal: 55,
+  },
+
+  // Centers its children within the full contentArea (header-to-composer space),
+  // used for both the "structuring" pill and the "listening" pulse indicator.
+  centerOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 38,
+  },
+
+  structuringPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: Colors.light.surface,
+    gap: 8,
+    borderWidth: 1.5,
+    borderColor: Colors.light.borderStrong,
+    borderRadius: radii.pill,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  structuringPillText: { fontSize: 14, color: Colors.light.coralDeep, fontWeight: "600" },
+
+  followupCard: {
+    backgroundColor: Colors.light.surface,
+    borderRadius: radii.lg,
+    padding: spacing.md,
+    borderWidth: 1,
+    borderColor: Colors.light.border,
+    shadowColor: "#000",
+    shadowOpacity: 0.05,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 1,
+  },
+  followupHeader: { flexDirection: "row", alignItems: "center", gap: 6, marginBottom: 6 },
+  followupTitle: { fontSize: 15, fontWeight: "700", color: Colors.light.ink },
+  followupText: { fontSize: 14, color: Colors.light.inkMuted, lineHeight: 20, marginBottom: spacing.sm },
+  followupInputRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  followupInput: {
+    flex: 1,
+    backgroundColor: Colors.light.cream,
+    borderWidth: 1.5,
+    borderColor: Colors.light.borderStrong,
+    borderRadius: radii.md,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 12,
+    fontSize: 15,
+    color: Colors.light.ink,
+  },
+  followupSendBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: Colors.light.coral,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  errorCard: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+    backgroundColor: Colors.light.surface,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: Colors.light.border,
+    padding: spacing.md,
+  },
+  errorText: { flex: 1, fontSize: 14, color: Colors.light.danger, lineHeight: 20 },
+
+  // Premium confirmation card: soft diagonal coral gradient glow behind the content
+  // (same treatment as the home screen's "premiumCard"), tinted icon instead of a
+  // flat green circle, subtle shadow to lift it off the page.
+  savedCard: {
+    alignItems: "center",
+    backgroundColor: Colors.light.surface,
+    borderRadius: radii.lg,
+    padding: spacing.xl,
+    marginTop: spacing.sm,
+    marginBottom: spacing.lg,
+
+    borderWidth: 1,
+    borderColor: Colors.light.borderStrong,
+    shadowColor: "#000",
+    shadowOpacity: 0.08,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 3,
+    overflow: "hidden",
+    position: "relative",
+  },
+  savedCardGlow: { ...StyleSheet.absoluteFillObject },
+  savedCheck: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: Colors.light.coral + "1A",
+    borderWidth: 1.5,
+    borderColor: Colors.light.coral,
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: spacing.md,
+  },
+  savedTitle: { fontSize: 22, fontWeight: "800", color: Colors.light.ink, marginBottom: 6 },
+  savedText: { fontSize: 15, color: Colors.light.inkMuted, textAlign: "center", lineHeight: 22, marginBottom: spacing.lg },
+  savedDoneBtn: { backgroundColor: Colors.light.coral, paddingHorizontal: spacing.xl, paddingVertical: 12, borderRadius: radii.pill },
+  savedDoneLabel: { fontSize: 16, fontWeight: "700", color: "#fff" },
+
+  promptActionsRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: spacing.sm },
+  collisionBtn: { backgroundColor: Colors.light.cream, borderWidth: 1.5, borderColor: Colors.light.borderStrong, borderRadius: radii.pill, paddingHorizontal: 14, paddingVertical: 10 },
+  collisionBtnLabel: { fontSize: 13, fontWeight: "600", color: Colors.light.ink },
+  suggestedTimesRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: spacing.sm },
+  suggestedTimeBtn: { backgroundColor: Colors.light.coralSoft, borderRadius: radii.pill, paddingHorizontal: 14, paddingVertical: 10 },
+  suggestedTimeBtnLabel: { fontSize: 13, fontWeight: "700", color: Colors.light.coralDeep },
+ 
+
+  // ---- Composer (chat-style, pinned to bottom but lifted off the edge) ----
+  composerOuter: {
+    paddingHorizontal: spacing.md,
+    paddingTop: spacing.xs ?? 4,
+    paddingBottom: spacing.sm,
+    marginBottom: COMPOSER_LIFT,
+  },
+  composerBar: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 6,
+    backgroundColor: Colors.light.surface,
+    borderWidth: 1.5,
+    borderRadius: 55,
+    paddingHorizontal: 18,
+    paddingVertical: 22,
+    shadowColor: "#000",
+    shadowOpacity: 0.08,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 3,
+  },
+  composerInput: {
+    flex: 1,
+    fontSize: 18,
+    color: Colors.light.ink,
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+    maxHeight: 120,
+  },
+  composerMicBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 40,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: Colors.light.coral,
+    opacity: 0.4 
+  },
+
+
+  composerMicBtnActive: {
+    backgroundColor: Colors.light.coral,
+  },
+  composerSendBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: Colors.light.coral,
+  },
+  btnDisabled: { opacity: 0.4 },
+
+  // ---- Pulsing "listening" indicator ----
+  pulseRingsBox: {
+    width: 72,
+    height: 72,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  pulseRing: {
+    position: "absolute",
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: Colors.light.coral,
+  },
+  pulseCore: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: Colors.light.coralDeep,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  pulseLabel: { fontSize: 13, fontWeight: "600", color: Colors.light.inkMuted },
+
+  // ---- Offline banner (small pill under the header) ----
+  offlineBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    alignSelf: "center",
+    backgroundColor: Colors.light.warn + "1A",
+    borderWidth: 1,
+    borderColor: Colors.light.warn,
+    borderRadius: radii.pill,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    marginBottom: 4,
+  },
+  offlineBannerText: { fontSize: 12, fontWeight: "700", color: Colors.light.warn },
+
+  // ---- Offline manual entry — premium card, same visual language as the home
+  // screen's "premiumCard" (diagonal coral glow, tinted icon chip, soft shadow). ----
+  offlineCheckingBox: { paddingVertical: spacing.lg, alignItems: "center", justifyContent: "center" },
+
+  offlineCard: {
+    borderRadius: radii.lg,
+    padding: spacing.lg,
+    backgroundColor: Colors.light.surface,
+    borderWidth: 1,
+    borderColor: Colors.light.borderStrong,
+    overflow: "hidden",
+    position: "relative",
+    shadowColor: "#000",
+    shadowOpacity: 0.06,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 2,
+    gap: spacing.sm,
+  },
+  offlineCardGlow: { ...StyleSheet.absoluteFillObject },
+  offlineCardHeader: { flexDirection: "row", alignItems: "center", gap: spacing.sm, marginBottom: 2 },
+  offlineIconWrap: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: Colors.light.coralSoft,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  offlineEyebrow: { fontSize: 12, fontWeight: "700", letterSpacing: 1.2, color: Colors.light.inkMuted },
+
+  offlineTypeRow: { flexDirection: "row", gap: 8 },
+  offlineTypeBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    backgroundColor: Colors.light.cream,
+    borderWidth: 1.5,
+    borderColor: Colors.light.border,
+    borderRadius: radii.pill,
+    paddingVertical: 10,
+  },
+  offlineTypeBtnActive: { backgroundColor: Colors.light.coral, borderColor: Colors.light.coral },
+  offlineTypeBtnLabel: { fontSize: 13, fontWeight: "700", color: Colors.light.coralDeep },
+  offlineTypeBtnLabelActive: { color: "#fff" },
+
+  offlineFieldLabel: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: Colors.light.inkMuted,
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+    marginTop: 4,
+  },
+  offlineInput: {
+    backgroundColor: Colors.light.cream,
+    borderWidth: 1.5,
+    borderColor: Colors.light.border,
+    borderRadius: radii.md,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 12,
+    fontSize: 15,
+    color: Colors.light.ink,
+  },
+  offlineInputMultiline: { minHeight: 56, textAlignVertical: "top" },
+
+  offlineChoiceRow: { flexDirection: "row", gap: 8 },
+  offlineChoiceBtn: {
+    flex: 1,
+    alignItems: "center",
+    backgroundColor: Colors.light.cream,
+    borderWidth: 1.5,
+    borderColor: Colors.light.border,
+    borderRadius: radii.pill,
+    paddingVertical: 10,
+  },
+  offlineChoiceBtnActive: { backgroundColor: Colors.light.coral, borderColor: Colors.light.coral },
+  offlineChoiceLabel: { fontSize: 13, fontWeight: "600", color: Colors.light.ink },
+  offlineChoiceLabelActive: { color: "#fff" },
+
+  offlineHelperText: { fontSize: 12, color: Colors.light.inkFaint, marginTop: -2 },
+
+  offlineTimeRow: { flexDirection: "row", gap: 8, alignItems: "center" },
+  offlineTimeInput: { flex: 1 },
+  offlineAmPmGroup: { flexDirection: "row", gap: 6 },
+  offlineAmPmBtn: {
+    width: 48,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: Colors.light.cream,
+    borderWidth: 1.5,
+    borderColor: Colors.light.border,
+    borderRadius: radii.md,
+    paddingVertical: 12,
+  },
+  offlineAmPmBtnActive: { backgroundColor: Colors.light.coral, borderColor: Colors.light.coral },
+  offlineAmPmLabel: { fontSize: 13, fontWeight: "700", color: Colors.light.ink },
+  offlineAmPmLabelActive: { color: "#fff" },
+
+  offlinePreviewPill: {
+    alignSelf: "flex-start",
+    backgroundColor: Colors.light.coralSoft,
+    borderRadius: radii.pill,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    marginTop: 2,
+  },
+  offlinePreviewText: { fontSize: 13, fontWeight: "700", color: Colors.light.coralDeep },
+
+  offlineErrorRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+  offlineFormErrorText: { fontSize: 13, color: Colors.light.danger, flex: 1 },
+
+  offlineSubmitBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    backgroundColor: Colors.light.coral,
+    borderRadius: radii.pill,
+    paddingVertical: 14,
+    marginTop: spacing.sm,
+  },
+  offlineSubmitLabel: { fontSize: 15, fontWeight: "700", color: "#fff" },
+});

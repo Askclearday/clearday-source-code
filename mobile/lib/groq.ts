@@ -1,0 +1,1649 @@
+// Groq API integration for Daily Brief.
+//
+// MODEL: reverted to llama-3.3-70b-versatile per explicit request, KNOWING that Groq announced
+// its deprecation on 2026-06-17 and has a hard shutdown date of August 2026 for free/developer
+// tier usage. This model WILL stop responding after that date — this is a temporary revert, not
+// a long-term fix. When it breaks, the drop-in replacements Groq recommends are
+// openai/gpt-oss-120b or qwen/qwen3.6-27b (see console.groq.com/docs/deprecations).
+//
+// llama-3.3-70b-versatile has NO native reasoning_effort/reasoning_format knobs (those are
+// gpt-oss/qwen-specific) — all of that plumbing has been removed from callGroq below. This also
+// means date-math and association/linking are being done by a plain non-reasoning model, which is
+// measurably weaker at multi-step judgment than the reasoning-tier model this file used to call.
+// To compensate, two things that used to be left entirely to the model are now ALSO enforced in
+// code as a safety net (see clampMealSuggestion and enforceLinkedSuggestion below):
+//   1. Meal-based suggested times (dinner/lunch/breakfast with no time stated) are clamped into
+//      their ordinary real-world window even if the model suggests something like 22:00 for
+//      "dinner".
+//   2. When an item is linked (linked_existing_id / linked_item_index) but the model fails to
+//      produce a suggested_date/suggested_time for it, we deterministically derive one from the
+//      anchor's own date/time instead of leaving it null/"someday".
+//
+// Two structuring prompt types (both association-aware, not just the batch one):
+//   1. Single-item structuring — one capture -> strict JSON { type, title, ... }
+//   2. Multi-item structuring — one block of text containing several captures -> JSON array
+// Both take an `existingItems` slice of the user's real upcoming reminders/calendar events so
+// the model has something real to cross-reference ("for the date", "during work", etc.) instead
+// of guessing blind. The multi-item prompt additionally cross-references within the same batch.
+//
+// Env: EXPO_PUBLIC_GROQ_API_KEY (referenced via process.env at runtime).
+import type { BriefContext, StructuredItem } from "./types";
+
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
+
+function getApiKey(): string {
+  const key = process.env.EXPO_PUBLIC_GROQ_API_KEY;
+  if (!key) return "";
+  return key;
+}
+
+interface GroqMessage {
+  role: "system" | "user";
+  content: string;
+}
+
+// ----------------- LIGHTWEIGHT TPM AWARENESS -----------------
+// NOTE: this conservative 7500-token budget was tuned for a different model's free-tier limits.
+// Groq's own docs currently list llama-3.3-70b-versatile at 300K TPM on the developer plan, which
+// is far higher than this budget assumes — worth revisiting/loosening once you confirm your
+// actual account's rate limit, since as-is this may throttle harder than necessary. Left
+// conservative for now so nothing regresses silently.
+const TPM_SAFE_BUDGET = 7500;
+const MAX_PRESEND_WAIT_MS = 3000;
+const tokenWindow: { timestamp: number; tokens: number }[] = [];
+
+function estimateTokens(messages: GroqMessage[], maxTokens: number): number {
+  const chars = messages.reduce((sum, m) => sum + m.content.length, 0);
+  return Math.ceil(chars / 4) + maxTokens;
+}
+
+function pruneWindow(): number {
+  const now = Date.now();
+  while (tokenWindow.length && now - tokenWindow[0].timestamp > 60_000) {
+    tokenWindow.shift();
+  }
+  return tokenWindow.reduce((sum, e) => sum + e.tokens, 0);
+}
+
+async function maybeWaitForBudget(estimate: number): Promise<void> {
+  const used = pruneWindow();
+  if (used + estimate <= TPM_SAFE_BUDGET) {
+    tokenWindow.push({ timestamp: Date.now(), tokens: estimate });
+    return;
+  }
+  await new Promise((resolve) => setTimeout(resolve, MAX_PRESEND_WAIT_MS));
+  tokenWindow.push({ timestamp: Date.now(), tokens: estimate });
+}
+
+async function callGroqOnce(body: Record<string, unknown>, key: string): Promise<Response> {
+  return fetch(GROQ_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+    body: JSON.stringify(body),
+  });
+}
+
+async function callGroq(
+  messages: GroqMessage[],
+  jsonMode = false,
+  maxTokens = 600
+): Promise<string> {
+  const key = getApiKey();
+  if (!key) throw new Error("MISSING_GROQ_KEY");
+  const body: Record<string, unknown> = {
+    model: GROQ_MODEL,
+    messages,
+    temperature: 0.8,
+    max_tokens: maxTokens,
+  };
+  if (jsonMode) {
+    body.response_format = { type: "json_object" };
+  }
+
+  await maybeWaitForBudget(estimateTokens(messages, maxTokens));
+
+  let res = await callGroqOnce(body, key);
+
+  if (res.status === 429) {
+    const retryAfterHeader = res.headers.get("retry-after");
+    const waitMs = retryAfterHeader ? Math.ceil(parseFloat(retryAfterHeader) * 1000) : 5000;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(Math.max(waitMs, 1000), 12000)));
+    res = await callGroqOnce(body, key);
+  }
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`GROQ_HTTP_${res.status}: ${text.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  const content: string | undefined = data?.choices?.[0]?.message?.content;
+  if (!content) {
+    const finishReason = data?.choices?.[0]?.finish_reason ?? "unknown";
+    const usage = JSON.stringify(data?.usage ?? {});
+    throw new Error(`GROQ_EMPTY_RESPONSE (finish_reason=${finishReason}, usage=${usage})`);
+  }
+  return content;
+}
+
+// ----------------- AUDIO TRANSCRIPTION (Groq Whisper) -----------------
+// Added so lib/groq.ts exports transcribeAudioFile(uri), which capture.tsx already calls
+// (see transcribeAndInsert / retryAudioMessage there). Uses Groq's hosted Whisper endpoint
+// via a multipart/form-data upload of the on-device recording URI -- no existing code in
+// this file is modified, only this new block is added.
+const GROQ_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
+const GROQ_TRANSCRIBE_MODEL = "whisper-large-v3-turbo";
+
+async function callGroqTranscribeOnce(uri: string, key: string): Promise<Response> {
+  const form = new FormData();
+  // React Native's fetch/FormData accepts this {uri,name,type} shape directly for a local
+  // file URI -- no need to read the file into memory first.
+  form.append("file", ({
+    uri,
+    name: "recording.m4a",
+    type: "audio/m4a",
+  } as unknown) as Blob);
+  form.append("model", GROQ_TRANSCRIBE_MODEL);
+  form.append("response_format", "json");
+
+  return fetch(GROQ_TRANSCRIPTION_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}` },
+    body: form,
+  });
+}
+
+// Error codes follow the same convention callGroq() already uses (GROQ_HTTP_*), but with a
+// GROQ_TRANSCRIBE_HTTP_* prefix -- capture.tsx's describeNetworkError() already pattern-matches
+// on exactly these strings (GROQ_TRANSCRIBE_HTTP_4\d\d, GROQ_TRANSCRIBE_HTTP_429,
+// GROQ_TRANSCRIBE_HTTP_5\d\d) to show a specific failure reason next to Retry/Try offline.
+export async function transcribeAudioFile(uri: string): Promise<string> {
+  const key = getApiKey();
+  if (!key) throw new Error("MISSING_GROQ_KEY");
+
+  let res = await callGroqTranscribeOnce(uri, key);
+
+  if (res.status === 429) {
+    const retryAfterHeader = res.headers.get("retry-after");
+    const waitMs = retryAfterHeader ? Math.ceil(parseFloat(retryAfterHeader) * 1000) : 5000;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(Math.max(waitMs, 1000), 12000)));
+    res = await callGroqTranscribeOnce(uri, key);
+  }
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`GROQ_TRANSCRIBE_HTTP_${res.status}: ${text.slice(0, 200)}`);
+  }
+
+  const data = await res.json();
+  return typeof data?.text === "string" ? data.text : "";
+}
+
+// ----------------- TIME FORMATTING (12h, contextual) -----------------
+
+export function formatTime12h(time: string | null | undefined): string {
+  if (!time) return "";
+  const [hStr, mStr] = time.split(":");
+  const h = parseInt(hStr, 10);
+  const m = parseInt(mStr ?? "0", 10);
+  if (Number.isNaN(h)) return time;
+  if (h === 0 && m === 0) return "midnight";
+  if (h === 12 && m === 0) return "noon";
+  const ampm = h >= 12 ? "PM" : "AM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return m === 0 ? `${h12} ${ampm}` : `${h12}:${String(m).padStart(2, "0")} ${ampm}`;
+}
+
+// ----------------- EXISTING-ITEM CONTEXT (for association) -----------------
+
+export interface ExistingItemContext {
+  id: string;
+  type: "reminder" | "calendar_event";
+  title: string;
+  date: string | null;
+  time: string | null;
+}
+
+const MAX_EXISTING_ITEMS_IN_PROMPT = 5;
+
+function formatExistingItemsBlock(existing: ExistingItemContext[] | undefined): string {
+  if (!existing || existing.length === 0) {
+    return "(none provided)";
+  }
+  const capped = existing.slice(0, MAX_EXISTING_ITEMS_IN_PROMPT);
+  const lines = capped
+    .map((i) => `- [id:${i.id}] (${i.type}) "${i.title}" ${i.date ?? "?"} ${i.time ?? "?"}`)
+    .join("\n");
+  const omitted = existing.length - capped.length;
+  return omitted > 0 ? `${lines}\n(+${omitted} more not shown)` : lines;
+}
+
+// ----------------- SHARED STRUCTURING BUILDING BLOCKS -----------------
+//
+// STRUCTURING_RULES, ASSOCIATION_RULES, and SUGGESTION_RULES are exported as their own constants
+// and spliced verbatim into BOTH the single-item and multi-item prompts below. Never let the two
+// prompts drift by editing rules in one place and not the other — edit these three constants and
+// both prompts pick the change up automatically.
+
+export const STRUCTURING_INTRO = `You are the capture engine for a personal assistant app called Clearday.
+The user will give you a short spoken or typed phrase describing something they want to save —
+a note, a calendar event, or a reminder.
+
+Your job: classify it and return ONE item as strict JSON, no markdown, no explanation, no code fences.`;
+
+export const STRUCTURING_SCHEMA = `Return ONLY a JSON object with EXACTLY these keys:
+{
+  "type": "note" | "calendar_event" | "reminder",
+  "title": string,
+  "details": string,
+  "date": "YYYY-MM-DD" | null,
+  "time": "HH:MM" | null,
+  "time_range_end": "HH:MM" | null,
+  "recurring": boolean,
+  "recurrence": "once" | "daily" | "weekly" | "weekdays" | "monthly" | "annually",
+  "category": "trip" | "birthday" | "assignment" | "deadline" | "general",
+  "reminder_offset_minutes": number | null,
+  "needs_confirmation": boolean,
+  "linked_existing_id": string | null,
+  "suggested_date": "YYYY-MM-DD" | null,
+  "suggested_time": "HH:MM" | null,
+  "suggestion_reason": string | null,
+  "secondary_reminder": { "date": "YYYY-MM-DD" | null, "time": "HH:MM" | null, "title": string } | null
+}`;
+
+export const STRUCTURING_RULES = `CLASSIFICATION:
+- reminder: default for any task/action phrase ("call dad", "buy milk") even with no
+  date/time, and for deadlines/birthdays. This also covers any content where the user
+  signals — explicitly OR implicitly — that they want to be reminded, notified, or to
+  recall something later. An explicit trigger phrase is NOT required: a hint of "I'll
+  want this again" is enough. A date/time is NEVER a requirement for this classification
+  — if the user gives no time/date, it is still classified as "reminder"; the actual time
+  to use is resolved by separate downstream logic, not here.
+  "remind me"/"remember to"/"don't forget" -> default to reminder, UNLESS it's clearly a
+  trailing nudge on a much longer note passage (see NOTE+EMBEDDED REMINDER below), in
+  which case the whole passage stays a note, and the nudge itself is captured separately
+  as its own reminder via "secondary_reminder".
+- NOTE + EMBEDDED REMINDER: a long/journal-style passage with a trailing nudge ("...remind
+  me about this at 6:30") stays ONE "note" (full passage as details/title). Also populate
+  "secondary_reminder" with the nudge's date/time if one was given — and if the nudge has
+  no date/time, "secondary_reminder" is still populated (just without a date/time value;
+  that gets resolved downstream, same as any other timeless reminder). Always give it a
+  real descriptive title (never a bare "remind me at 6:30" title). "secondary_reminder" is
+  saved as an independent reminder record in its own right — this case produces BOTH a
+  note AND a reminder, not a note alone. No embedded nudge -> secondary_reminder is null.
+- calendar_event: any activity, task, appointment, or commitment that occupies a meaningful block of time in a person's schedule and is something the user would reasonably reserve time for. This includes:
+  * activities tied to a specific clock time ("team meeting at 3:15pm", "lunch reservation at 1")
+  * activities with a stated date but no exact time ("on Saturday I want to attend the workshop")
+  * named activities with no date/time stated ("coffee meetup at Riverside Café") — still calendar_event by intent; leave date/time null per NEVER INVENT DATE below.
+  * tasks or activities that require a dedicated time window or are expected to take a substantial period of time ("organize my room", "prepare the quarterly report", "go to the supermarket", "attend a medical appointment", "practice piano for an hour", "take a long walk").
+
+DATES:
+- "next week" alone = coming Monday. "next Tuesday" = that weekday this/next week.
+  "today"/"tomorrow"/"this Friday" resolve normally against CURRENT_DATE.
+- "by midnight"/"end of day" -> 23:59. "by lunch" -> 12:00. "by EOB" -> 17:00.
+- Meal word, no date stated: resolve to the meal's next natural window (breakfast
+  07:00-10:00, lunch 12:00-14:00, dinner 18:00-21:00); roll to tomorrow if today's window
+  already passed (compare to CURRENT_TIME).
+- Bare clock time, no date word at all: compare it to CURRENT_TIME — still ahead today ->
+  today; already passed -> tomorrow. A stated clock time must never leave date null.
+- Bare hour, no am/pm anywhere in the phrase: compute both AM and PM candidates and pick
+  whichever is soonest relative to CURRENT_TIME (do not default to AM).
+- ABSOLUTE CALENDAR DATE ("5th of January", "January 5th", "on the 5th", "March 3rd",
+  "12/25"): resolve to that day/month with no ambiguity about which one is meant. Year is
+  never stated for these, so infer it: if that day/month still lies ahead of or on
+  CURRENT_DATE this year, use this year; if it has already passed this year, roll forward
+  to next year. "On the 5th" (day only, no month) resolves the same way against the
+  current month, rolling to next month if the day has already passed. A bare
+  day-of-month/month mention is a STATED date — it must never be treated as "nothing
+  stated" and must never fall through to NEVER INVENT A DATE.
+- GENERAL CATCH-ALL — SCAN FOR ANY TEMPORAL HINT: before applying NEVER INVENT A DATE,
+  reread the phrase once specifically looking for ANY scrap that implies timing, however
+  indirect — a weekday name, a month name, a day number, a season, a relative phrase
+  ("in two weeks", "next month", "the weekend after next"), a holiday ("on Christmas",
+  "New Year's"), an event-adjacent phrase ("the night before my flight"), or an implicit
+  routine ("when I land", "after work"). If ANY such hint exists, resolve it using the
+  closest matching rule above (or ordinary real-world reasoning if no rule matches
+  exactly) rather than leaving date/time null. Only fall through to NEVER INVENT A DATE
+  when the phrase truly carries no timing signal of any kind. 
+
+RELATIVE DURATION ("in 30 min", "within an hour" — a number, no clock time): due = now +
+duration (date rolls to tomorrow only if it crosses midnight); reminder_offset_minutes ≈
+half the duration; never output 23:59/midnight for these.
+
+TIME RANGES: "between X and Y"/"from X to Y" -> time=X (start), time_range_end=Y (end).
+"up to X" (no start) -> time=null, time_range_end=X. "before X"/"by X" with a clock time
+-> time=X (the deadline itself).
+
+OFFSET SANITY CHECK (always do this before finalizing reminder_offset_minutes): confirm
+(due time − offset) still falls after CURRENT_TIME on the due date; if it would land in
+the past, shrink the offset so it lands a few minutes from now instead.
+
+REMINDER OFFSET: quick task 15-30min before. Focused task 1-2h before. High-stakes 2-4h
+before (same day). Calendar appointments (not deadlines): 10-15min or null. Null date ->
+null offset. Relative-duration phrases use the midpoint rule above instead.
+
+needs_confirmation = true ONLY for genuinely high-stakes/time-critical items: hard
+submission/payment/application deadlines, exams, flight/travel departure times, medical
+appointments, or a stakes-bearing "by X" cutoff / social plan (date, reservation) where
+getting the timing wrong has a real cost. Default false for everyday chores, calls,
+errands, routine meetings, walks, meals, birthdays, etc.
+
+RECURRENCE: explicit "always"/"every" -> matching value. Routine daily-life activities
+(cooking, workout, meds) -> daily. Weekday-only routines -> weekdays. Birthdays/
+anniversaries -> annually. Monthly-specific-day -> monthly. Otherwise -> once.
+recurring (boolean) = true whenever recurrence !== "once".
+
+CATEGORY: trip = travel/flights/vacations. birthday = birthdays/anniversaries.
+assignment = schoolwork due dates. deadline = submission/payment/application/"due"/"by".
+general = everything else.`;
+
+export const ASSOCIATION_RULES = `ASSOCIATION WITH THINGS ALREADY SAVED:
+EXISTING_ITEMS is a real slice of the user's own upcoming reminders/calendar events.
+Before finalizing an item, check whether the input actually refers to one of these.
+Signals it does: a direct backreference ("the date", "that trip", "for it"); a shared
+noun with no pronoun (a restaurant/person/trip name); or ordinary real-world dependency
+even with no shared word (a gift precedes the event it's for, packing precedes a trip,
+prep precedes a meeting) — treat that as a match too, the way a competent human assistant
+would without needing it spelled out.
+
+On a match: set "linked_existing_id" to that item's id, and derive a REAL "date"/"time"
+for the new item FROM the anchor (not just a suggestion) using ordinary lead-time logic
+(earlier the same day for a gift/prep item, evening before for an early departure). Mirror
+the same values into suggested_date/suggested_time. This OVERRIDES NEVER INVENT A DATE —
+a real link is itself enough certainty to resolve and index the item immediately, no
+follow-up needed.
+
+ORDERING FOR PREP/ACQUISITION ITEMS: when the new item is prep/acquisition FOR an anchor
+event (a gift, flowers, packing), its date/time MUST land strictly BEFORE the anchor's own
+date/time — never at the same moment, never after. Leave a couple of hours of lead time by
+default; if unsure, leave more lead time rather than less.
+
+DURING AN EVENT (different from prep/acquisition above — do not apply the BEFORE rule
+here): when the input says the new item happens "during"/"while"/"in the middle of"/
+"throughout" an anchor — e.g. "during the client meeting, remind me to send the recap",
+"during my birthday, remind me to call Aunt Rose" — link it the same way, but its date and
+time MUST land INSIDE the anchor's own window: the same date, at or a few minutes after the
+anchor's own start time. Never place it strictly before the anchor (that's only for
+prep/acquisition), and never fall back to an unrelated generic default just because no
+explicit time was stated in this phrase — the anchor's own date/time is the real anchor
+here, use it.
+
+No plausible match -> "linked_existing_id" stays null and NEVER INVENT A DATE applies
+normally.`;
+
+export const SUGGESTION_RULES = `SUGGESTED DEFAULTS (fill in for EVERY item, separate from and in
+addition to the authoritative "date"/"time" fields — a non-binding best guess only):
+- date/time already real -> suggested_date/suggested_time may mirror them or be left null,
+  either is fine.
+- date/time null (nothing stated) -> ALWAYS still produce a sensible suggested_date/
+  suggested_time, never leave both blank:
+  - Calling/messaging a person: 18:00-20:00 today if meaningful time remains (per
+    CURRENT_TIME), else tomorrow same window.
+  - Generic errand/task, no other context: next reasonable daytime hour, 09:00-18:00.
+  - "during work"/similar with no known hours: 10:30 or 14:30, unless EXISTING_ITEMS shows
+    an actual recurring work-hours block — use that instead.
+  - MEAL-BASED activities (breakfast/lunch/dinner), no time stated: suggested_time MUST
+    fall inside that meal's ordinary window (breakfast 07:00-10:00, lunch 12:00-14:00,
+    dinner 18:00-21:00) regardless of current time; roll to tomorrow's window if today's
+    has passed. This window rule applies equally when date/time are being resolved for
+    real (e.g. a "lunch date" calendar_event) — never place a meal-tagged item's real time
+    outside its window either.
+  - linked_existing_id / linked_item_index set: derive from the anchor's date/time using
+    lead-time logic (see ASSOCIATION RULES) — put the SAME derived values into the real
+    date/time fields too, not suggested_* alone, since a link means immediate indexing.
+- Always include a one-clause "suggestion_reason" in plain language for any non-null
+  suggestion (e.g. "a few hours before your dinner date so there's time to arrange them").
+  Null only when suggested_date/suggested_time are both left null.
+- Suggested moments must never land in the past relative to CURRENT_DATE/CURRENT_TIME —
+  roll forward exactly like a real date would.`;
+
+const STRUCTURING_CLOSING = `Today's date AND current time are provided in the user message. If a date truly can't be
+extracted, set date to null.
+
+If the phrase is gibberish or empty, return:
+{"type":"note","title":"(unclear)","details":"","date":null,"time":null,"time_range_end":null,"recurring":false,"recurrence":"once","category":"general","reminder_offset_minutes":null,"needs_confirmation":false,"linked_existing_id":null,"suggested_date":null,"suggested_time":null,"suggestion_reason":null,"secondary_reminder":null}
+Return ONLY the JSON object.`;
+
+const STRUCTURING_SYSTEM_PROMPT = `${STRUCTURING_INTRO}
+
+${STRUCTURING_SCHEMA}
+
+${STRUCTURING_RULES}
+
+${ASSOCIATION_RULES}
+
+${SUGGESTION_RULES}
+
+${STRUCTURING_CLOSING}`;
+
+// StructuredItem's shape lives in ./types and isn't editable from here, so raw_input and the new
+// association/suggestion fields are layered on as local extensions. Every function below that
+// returns a structured item returns this richer type instead of the bare StructuredItem, so none
+// of this is silently dropped between capture and whatever the app does with it next.
+export interface StructuredItemWithRaw extends StructuredItem {
+  raw_input: string | null;
+  linked_existing_id: string | null;
+  linked_item_index: number | null; // only ever set by the multi-item path; null from single-item
+  suggested_date: string | null;
+  suggested_time: string | null;
+  suggestion_reason: string | null;
+  secondary_reminder: { date: string | null; time: string | null; title: string } | null;
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+function toLocalISO(d: Date): string {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+function clampOffsetToNotBePast<T extends StructuredItemWithRaw>(
+  item: T,
+  todayISO: string,
+  currentTimeHHMM: string
+): T {
+  // Safety net: even with the prompt rules above, don't trust the model to always get this
+  // right. Clamp both the real due-time offset AND the suggested_date/suggested_time pair.
+  const [curH, curM] = currentTimeHHMM.split(":").map((x) => parseInt(x, 10));
+  const nowMin = curH * 60 + curM;
+
+  let next = item;
+
+  if (next.date === todayISO && next.time && next.reminder_offset_minutes != null) {
+    const [dueH, dueM] = next.time.split(":").map((x) => parseInt(x, 10));
+    if (![curH, curM, dueH, dueM].some((n) => Number.isNaN(n))) {
+      const dueMin = dueH * 60 + dueM;
+      const notifyMin = dueMin - next.reminder_offset_minutes;
+      if (notifyMin <= nowMin) {
+        const minutesUntilDue = Math.max(dueMin - nowMin, 0);
+        const safeLeadTime = Math.min(5, minutesUntilDue);
+        const safeOffset = Math.max(minutesUntilDue - safeLeadTime, 0);
+        next = { ...next, reminder_offset_minutes: safeOffset };
+      }
+    }
+  }
+
+  if (next.suggested_date === todayISO && next.suggested_time) {
+    const [sh, sm] = next.suggested_time.split(":").map((x) => parseInt(x, 10));
+    if (![curH, curM, sh, sm].some((n) => Number.isNaN(n))) {
+      const suggestMin = sh * 60 + sm;
+      if (suggestMin <= nowMin) {
+        // Push the suggestion ~5 minutes from now rather than leaving it in the past.
+        const pushedMin = Math.min(nowMin + 5, 23 * 60 + 59);
+        const ph = Math.floor(pushedMin / 60);
+        const pm = pushedMin % 60;
+        next = { ...next, suggested_time: `${pad2(ph)}:${pad2(pm)}` };
+      }
+    }
+  }
+
+  return next;
+}
+
+// ----------------- AMBIGUOUS BARE-HOUR SAFETY NET (fixes "remind me at 6:30" -> tomorrow AM) -----
+// A plain non-reasoning model tends to default a bare "H:MM" with no am/pm marker to the AM
+// reading, which can push a same-day evening reminder a full day out. Rather than trust the
+// prompt rule alone, re-derive the AM/PM choice ourselves: whichever reading (AM or PM) is the
+// SOONER upcoming moment relative to current time wins. Only touches items whose raw_input truly
+// has no am/pm marker anywhere — if the user said "6:30pm" explicitly, that's a real fact and is
+// left alone.
+function hasExplicitAmPm(text: string): boolean {
+  return /\b(am|pm)\b/i.test(text) || /\d\s*(am|pm)\b/i.test(text);
+}
+
+function hasBareClockTime(text: string): boolean {
+  return /\b\d{1,2}:\d{2}\b/.test(text);
+}
+
+function resolveAmbiguousBareTime<T extends StructuredItemWithRaw>(
+  item: T,
+  fallbackRaw: string,
+  currentTimeHHMM: string
+): T {
+  if (item.type !== "reminder" && item.type !== "calendar_event") return item;
+  if (!item.time) return item;
+
+  const source = item.raw_input ?? fallbackRaw ?? item.title ?? "";
+  if (!source || !hasBareClockTime(source) || hasExplicitAmPm(source)) return item;
+
+  const [hStr, mStr] = item.time.split(":");
+  const h = parseInt(hStr, 10);
+  const m = parseInt(mStr, 10);
+  if ([h, m].some((n) => Number.isNaN(n))) return item;
+  if (h === 0 || h === 12) return item; // midnight/noon are unambiguous already
+
+  const altH = h < 12 ? h + 12 : h - 12;
+
+  const [curH, curM] = currentTimeHHMM.split(":").map((x) => parseInt(x, 10));
+  if ([curH, curM].some((n) => Number.isNaN(n))) return item;
+  const nowMin = curH * 60 + curM;
+
+  const deltaFor = (hour: number) => {
+    const raw = hour * 60 + m - nowMin;
+    return raw >= 0 ? raw : raw + 24 * 60;
+  };
+  const deltaOriginal = deltaFor(h);
+  const deltaAlt = deltaFor(altH);
+  if (deltaAlt >= deltaOriginal) return item; // model's own reading was already the sooner one
+
+  const now = new Date();
+  const target = new Date(now.getTime() + deltaAlt * 60000);
+  return { ...item, date: toLocalISO(target), time: `${pad2(target.getHours())}:${pad2(target.getMinutes())}` };
+}
+
+// ----------------- MEAL-WINDOW SAFETY NET (fixes "dinner at 10pm") -----------------
+// A plain non-reasoning model can drift outside a meal's ordinary window even when the prompt
+// says not to (this is exactly the "dinner suggested at 10pm" bug). Rather than trust the prompt
+// alone, clamp suggested_time back into the right window whenever: (a) the item is meal-related
+// based on its own raw_input, and (b) the user did NOT state an explicit clock time themselves
+// (if they did, that's a real fact and must never be overridden). This now clamps BOTH the real
+// date/time fields (e.g. a "lunch date" calendar_event resolved for real) and the suggested_*
+// fields — clamping suggested_* alone left real times free to drift outside the window, which is
+// exactly what happened with a "lunch date" landing at 2:30pm.
+const MEAL_WINDOWS: Record<"breakfast" | "lunch" | "dinner", [number, number]> = {
+  breakfast: [7 * 60, 10 * 60],
+  lunch: [12 * 60, 14 * 60],
+  dinner: [18 * 60, 21 * 60],
+};
+
+function detectMealKeyword(text: string): keyof typeof MEAL_WINDOWS | null {
+  const lower = text.toLowerCase();
+  if (/\bdinner\b/.test(lower)) return "dinner";
+  if (/\blunch\b/.test(lower)) return "lunch";
+  if (/\bbreakfast\b/.test(lower)) return "breakfast";
+  return null;
+}
+
+function hasExplicitClockTime(text: string): boolean {
+  return /\b\d{1,2}(:\d{2})?\s*(am|pm)\b/i.test(text) || /\b\d{1,2}:\d{2}\b/.test(text);
+}
+
+function addDaysToISO(iso: string, days: number): string {
+  const d = new Date(`${iso}T00:00:00`);
+  d.setDate(d.getDate() + days);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+// Clamps a single (date, time) pair into the given meal's window, rolling to tomorrow if today's
+// window has already fully passed. Shared by both the real date/time clamp and the suggested_*
+// clamp below so the two never drift out of sync with each other.
+function clampPairToMealWindow(
+  date: string | null,
+  time: string | null,
+  meal: keyof typeof MEAL_WINDOWS,
+  todayISO: string,
+  currentTimeHHMM: string
+): { date: string | null; time: string | null } {
+  if (!time) return { date, time };
+  const [winStart, winEnd] = MEAL_WINDOWS[meal];
+  const midMin = Math.round((winStart + winEnd) / 2);
+  const midTime = `${pad2(Math.floor(midMin / 60))}:${pad2(midMin % 60)}`;
+
+  const effectiveDate = date ?? todayISO;
+  const [curH, curM] = currentTimeHHMM.split(":").map((x) => parseInt(x, 10));
+  const nowMin = curH * 60 + curM;
+  if (effectiveDate === todayISO && !Number.isNaN(nowMin) && nowMin >= winEnd) {
+    return { date: addDaysToISO(todayISO, 1), time: midTime };
+  }
+
+  const [th, tm] = time.split(":").map((x) => parseInt(x, 10));
+  if ([th, tm].some((n) => Number.isNaN(n))) return { date, time };
+  const totalMin = th * 60 + tm;
+  if (totalMin >= winStart && totalMin <= winEnd) return { date, time }; // already sane
+
+  return { date: effectiveDate, time: midTime };
+}
+
+function clampMealSuggestion<T extends StructuredItemWithRaw>(
+  item: T,
+  todayISO: string,
+  currentTimeHHMM: string
+): T {
+  const source = item.raw_input ?? item.title ?? "";
+  if (!source || hasExplicitClockTime(source)) return item;
+  const meal = detectMealKeyword(source);
+  if (!meal) return item;
+
+  let next = item;
+
+  if (next.time) {
+    const clampedReal = clampPairToMealWindow(next.date, next.time, meal, todayISO, currentTimeHHMM);
+    next = { ...next, date: clampedReal.date, time: clampedReal.time };
+  }
+
+  if (next.suggested_time) {
+    const clampedSuggested = clampPairToMealWindow(
+      next.suggested_date,
+      next.suggested_time,
+      meal,
+      todayISO,
+      currentTimeHHMM
+    );
+    next = { ...next, suggested_date: clampedSuggested.date, suggested_time: clampedSuggested.time };
+  }
+
+  return next;
+}
+
+// ----------------- LINKED-ITEM SUGGESTION SAFETY NET (fixes "flowers -> someday", and fixes
+// "flowers scheduled AFTER the date it's for") -----------------
+// If the model correctly sets linked_existing_id / linked_item_index but then fails to actually
+// carry the anchor's timing into suggested_date/suggested_time (leaving them null, i.e. "someday"
+// in the app), derive it ourselves from data we already have — we don't need the model for this
+// part, we HAVE the anchor's real date/time right here in code. We also no longer blindly trust a
+// model-provided real date/time just because it's present: a linked prep/acquisition item (like
+// "buy flowers for the date") must land BEFORE its anchor, and the weak model sometimes gets the
+// ordering wrong (e.g. placing the flowers run after the dinner they're for). When that ordering
+// is violated, the deterministic lead-time derivation below wins instead.
+function deriveSuggestionFromAnchor(
+  anchorDate: string | null,
+  anchorTime: string | null
+): { date: string | null; time: string | null } {
+  if (!anchorDate) return { date: null, time: null };
+  if (!anchorTime) return { date: anchorDate, time: null };
+  const [ah, am] = anchorTime.split(":").map((x) => parseInt(x, 10));
+  if ([ah, am].some((n) => Number.isNaN(n))) return { date: anchorDate, time: null };
+
+  const LEAD_MINUTES = 180; // default: a few hours of lead time before the anchor event
+  let leadMin = ah * 60 + am - LEAD_MINUTES;
+  if (leadMin < 9 * 60) leadMin = 9 * 60; // don't push the suggestion earlier than 9am same day
+  const h = Math.floor(leadMin / 60);
+  const m = leadMin % 60;
+  return { date: anchorDate, time: `${pad2(h)}:${pad2(m)}` };
+}
+
+// True if (date,time) falls strictly before (anchorDate,anchorTime). A null time on either side
+// is treated leniently (date-only comparison) since not every anchor has a real time.
+function isStrictlyBeforeAnchor(
+  date: string | null,
+  time: string | null,
+  anchorDate: string,
+  anchorTime: string
+): boolean {
+  if (!date) return false;
+  if (date < anchorDate) return true;
+  if (date > anchorDate) return false;
+  if (!time) return true; // same day, no time of its own — treat as "earlier that day"
+  return time < anchorTime;
+}
+
+function findExistingItemById(
+  existingItems: ExistingItemContext[],
+  id: string | null
+): ExistingItemContext | null {
+  if (!id) return null;
+  return existingItems.find((i) => i.id === id) ?? null;
+}
+
+function enforceLinkedSuggestion<T extends StructuredItemWithRaw>(
+  item: T,
+  existingItems: ExistingItemContext[]
+): T {
+  if (!item.linked_existing_id) return item;
+  const anchor = findExistingItemById(existingItems, item.linked_existing_id);
+  if (!anchor) return item;
+
+  const derived = deriveSuggestionFromAnchor(anchor.date, anchor.time);
+
+  const needsRealDateTime = !item.date || !item.time;
+  const orderingViolated =
+    !needsRealDateTime &&
+    !!anchor.date &&
+    !!anchor.time &&
+    !isStrictlyBeforeAnchor(item.date, item.time, anchor.date, anchor.time);
+
+  let date = item.date;
+  let time = item.time;
+  if (needsRealDateTime || orderingViolated) {
+    date = derived.date ?? date;
+    time = derived.time ?? time;
+  }
+
+  const needsSuggestion = !item.suggested_date || !item.suggested_time;
+  const suggested_date = needsSuggestion || orderingViolated ? derived.date ?? item.suggested_date : item.suggested_date;
+  const suggested_time = needsSuggestion || orderingViolated ? derived.time ?? item.suggested_time : item.suggested_time;
+
+  const reason =
+    item.suggestion_reason ?? `Timed relative to "${anchor.title}", which this appears linked to.`;
+
+  return {
+    ...item,
+    date,
+    time,
+    suggested_date,
+    suggested_time,
+    suggestion_reason: reason,
+    reminder_offset_minutes:
+      item.reminder_offset_minutes ?? (needsRealDateTime && derived.time ? 30 : item.reminder_offset_minutes),
+  };
+}
+
+// Same idea as enforceLinkedSuggestion, but for an anchor that's ANOTHER item in this same batch
+// (multi-item structuring only) rather than something already saved.
+function resolveBatchAnchor(
+  items: StructuredItemWithRaw[],
+  idx: number | null
+): { date: string | null; time: string | null; title: string } | null {
+  if (idx == null || idx < 0 || idx >= items.length) return null;
+  const anchor = items[idx];
+  return {
+    date: anchor.date ?? anchor.suggested_date ?? null,
+    time: anchor.time ?? anchor.suggested_time ?? null,
+    title: anchor.title,
+  };
+}
+
+function enforceBatchLinkedSuggestion<T extends StructuredItemWithRaw>(
+  item: T,
+  allItems: StructuredItemWithRaw[]
+): T {
+  if (item.linked_item_index == null) return item;
+  const anchor = resolveBatchAnchor(allItems, item.linked_item_index);
+  if (!anchor) return item;
+
+  const derived = deriveSuggestionFromAnchor(anchor.date, anchor.time);
+
+  const needsRealDateTime = !item.date || !item.time;
+  const orderingViolated =
+    !needsRealDateTime &&
+    !!anchor.date &&
+    !!anchor.time &&
+    !isStrictlyBeforeAnchor(item.date, item.time, anchor.date, anchor.time);
+
+  let date = item.date;
+  let time = item.time;
+  if (needsRealDateTime || orderingViolated) {
+    date = derived.date ?? date;
+    time = derived.time ?? time;
+  }
+
+  const needsSuggestion = !item.suggested_date || !item.suggested_time;
+  const suggested_date = needsSuggestion || orderingViolated ? derived.date ?? item.suggested_date : item.suggested_date;
+  const suggested_time = needsSuggestion || orderingViolated ? derived.time ?? item.suggested_time : item.suggested_time;
+
+  const reason =
+    item.suggestion_reason ??
+    `Timed relative to "${anchor.title}", mentioned earlier in this same batch.`;
+
+  return {
+    ...item,
+    date,
+    time,
+    suggested_date,
+    suggested_time,
+    suggestion_reason: reason,
+    reminder_offset_minutes:
+      item.reminder_offset_minutes ?? (needsRealDateTime && derived.time ? 30 : item.reminder_offset_minutes),
+  };
+}
+
+
+// ----------------- DURING-EVENT TIMING SAFETY NET (fixes "during the meeting, remind me
+// X" landing hours away, and "during my birthday, remind me X" landing on the wrong day)
+// -----------------
+// ASSOCIATION_RULES above now describes DURING-EVENT phrasing explicitly, but this is a
+// weaker/different model than the file was originally tuned for, so don't fully trust it
+// to get the timing right -- same pattern as clampMealSuggestion/enforceLinkedSuggestion
+// elsewhere in this file. If the raw input says "during"/"while"/"in the middle of" an
+// anchor, force the date/time to land inside the anchor's own window, overriding whatever
+// the model produced (including any BEFORE-anchor lead time enforceLinkedSuggestion /
+// enforceBatchLinkedSuggestion may have applied above, which is for prep items only).
+const DURING_EVENT_PATTERN = /\b(during|while|in the middle of|throughout|as part of)\b/i;
+const BEFORE_EVENT_PATTERN = /\b(before|ahead of|prior to)\b/i;
+const DURING_EVENT_LEAD_MINUTES = 10; // land a few minutes into the event, never before it
+
+function isDuringEventPhrase(raw: string | null): boolean {
+  if (!raw) return false;
+  // If the phrase explicitly says "before"/"prior to" and NOT "during"/"while", that's a
+  // real prep-before-event case -- don't let this safety net override it.
+  if (BEFORE_EVENT_PATTERN.test(raw) && !DURING_EVENT_PATTERN.test(raw)) return false;
+  return DURING_EVENT_PATTERN.test(raw);
+}
+
+function deriveDuringEventTiming(
+  anchorDate: string | null,
+  anchorTime: string | null
+): { date: string | null; time: string | null } {
+  if (!anchorDate) return { date: null, time: null };
+  if (!anchorTime) return { date: anchorDate, time: null };
+  const [ah, am] = anchorTime.split(":").map((x) => parseInt(x, 10));
+  if ([ah, am].some((n) => Number.isNaN(n))) return { date: anchorDate, time: null };
+  const total = Math.min(ah * 60 + am + DURING_EVENT_LEAD_MINUTES, 23 * 60 + 59);
+  return { date: anchorDate, time: `${pad2(Math.floor(total / 60))}:${pad2(total % 60)}` };
+}
+
+function enforceDuringEventTiming<T extends StructuredItemWithRaw>(
+  item: T,
+  anchor: { date: string | null; time: string | null } | null
+): T {
+  if (!anchor || !anchor.date) return item;
+  if (!isDuringEventPhrase(item.raw_input)) return item;
+  const timing = deriveDuringEventTiming(anchor.date, anchor.time);
+  if (!timing.date) return item;
+  return {
+    ...item,
+    date: timing.date,
+    time: timing.time ?? item.time,
+    suggested_date: timing.date,
+    suggested_time: timing.time ?? item.suggested_time,
+    suggestion_reason: "Timed to land during the event you referenced, not before or after it.",
+  };
+}
+
+// ----------------- DYNAMIC MULTI-ITEM MAX_TOKENS (fixes silent under-extraction on long
+// dictation blocks) -----------------
+// Groq's llama-4-scout-17b-16e-instruct supports up to ~8K output tokens. This schema is
+// verbose per item (16 fields incl. a raw_input echo and a prose suggestion_reason), so a
+// long dictated block with many distinct items can legitimately need several thousand
+// output tokens. A fixed low cap silently truncates the array (or the JSON generator
+// closes it early to stay valid) -- exactly what caused a ~30-item brain dump to come back
+// as only a handful of items with zero calendar events. Scale with input size instead,
+// capped safely under Groq's ceiling.
+const MULTI_ITEM_MAX_TOKENS_CEILING = 7500;
+const MULTI_ITEM_MAX_TOKENS_FLOOR = 1500;
+const MULTI_ITEM_TOKENS_PER_INPUT_CHAR = 1.4; // empirical: verbose per-item JSON output
+
+function estimateMultiItemMaxTokens(raw: string): number {
+  const estimate = Math.ceil(raw.length * MULTI_ITEM_TOKENS_PER_INPUT_CHAR);
+  return Math.min(MULTI_ITEM_MAX_TOKENS_CEILING, Math.max(MULTI_ITEM_MAX_TOKENS_FLOOR, estimate));
+}
+
+export async function structureInput(
+  raw: string,
+  todayISO: string,
+  currentTimeHHMM: string,
+  existingItems: ExistingItemContext[] = []
+): Promise<StructuredItemWithRaw> {
+  const userMsg = `CURRENT_DATE: ${todayISO}
+CURRENT_TIME: ${currentTimeHHMM} (24h)
+
+EXISTING_ITEMS:
+${formatExistingItemsBlock(existingItems)}
+
+User input: """${raw}"""`;
+
+  const rawResponse = await callGroq(
+    [
+      { role: "system", content: STRUCTURING_SYSTEM_PROMPT },
+      { role: "user", content: userMsg },
+    ],
+    true, 350
+  );
+  let parsed = parseStructuredItem(rawResponse);
+  // Single-item capture: the entire input the user gave us IS this one item, so raw_input is
+  // deterministically the full trimmed input — no need to trust the model to echo it back.
+  parsed.raw_input = raw.trim();
+  parsed.linked_item_index = null; // not applicable outside a batch
+
+  parsed = enforceLinkedSuggestion(parsed, existingItems);
+  parsed = enforceDuringEventTiming(
+    parsed,
+    findExistingItemById(existingItems, parsed.linked_existing_id)
+  );
+  parsed = clampMealSuggestion(parsed, todayISO, currentTimeHHMM);
+  parsed = resolveAmbiguousBareTime(parsed, raw, currentTimeHHMM);
+  return clampOffsetToNotBePast(parsed, todayISO, currentTimeHHMM);
+}
+
+// ----------------- BULK / MULTI-ITEM STRUCTURING -----------------
+// The user may dictate or type one long block of text that actually contains several distinct
+// notes, reminders, and/or calendar events at once. This splits that block into separate items
+// in one AI call, reusing the exact same classification/date/time/association/suggestion rules
+// as the single-item prompt above, PLUS a same-batch cross-referencing pass — an item can now
+// also link to another item earlier in the SAME block (e.g. "buy flowers for date" linking to
+// "dinner date at Campinski" said two sentences earlier), not just to EXISTING_ITEMS.
+const MULTI_STRUCTURING_SYSTEM_PROMPT = `You are the capture engine for a personal assistant app called
+Clearday. The input may contain MULTIPLE distinct things to save at once — any mix of
+notes, calendar events, and reminders, possibly related to each other or to EXISTING_ITEMS.
+
+Read the entire batch once, then split it into however many distinct items it actually
+contains (1 or more). Classify + structure EACH one using the same rules as a single-item
+capture, resolved independently against CURRENT_DATE/CURRENT_TIME — but stay consistent
+when two items reference the same rolled-forward day.
+
+Keep one continuous passage (a journal entry, a rambling related paragraph) as ONE note —
+only split when the text genuinely moves on to a distinct, unrelated thing.
+
+${STRUCTURING_RULES}
+
+${ASSOCIATION_RULES}
+
+SAME-BATCH LINKING: everything above about linking to EXISTING_ITEMS applies equally to
+OTHER ITEMS IN THIS SAME BATCH — backreferences, shared nouns, or ordinary real-world
+dependency between items you're outputting, not just against EXISTING_ITEMS. When the
+anchor is ALSO in this batch, set "linked_item_index" to the anchor's index in your own
+output array instead of "linked_existing_id" (set only one, never both, never link an item
+to itself). Derive suggested/real date-time from that anchor the same lead-time way.
+
+${SUGGESTION_RULES}
+
+RAW INPUT: for every item, "raw_input" must be the EXACT slice of the original text
+belonging to that item only — never the whole block, never overlapping another item's
+slice, wording/casing preserved as-is (don't paraphrase or clean it up). Don't split a
+single sentence into fragments, and don't invent items that aren't there. If two parts of
+the text clearly describe the same underlying thing, that's still ONE item.
+
+Return ONLY strict JSON, no markdown, no preamble, no code fences, in exactly this shape:
+{"items": [ { "type", "title", "details", "date", "time", "time_range_end", "recurring",
+"recurrence", "category", "reminder_offset_minutes", "needs_confirmation",
+"linked_existing_id", "linked_item_index", "suggested_date", "suggested_time",
+"suggestion_reason", "secondary_reminder", "raw_input" }, ... ]}
+Each object uses exactly the keys/types described above. If nothing usable is found,
+return {"items": []}.`;
+
+// Fallback safety net for the NOTE-WITH-EMBEDDED-SELF-REMINDER rule above: the model is weak and
+// sometimes still emits a bare, contentless reminder title like "remind me at 6:30" even when
+// asked not to. If we see exactly that pattern come back as a "reminder" item's title/raw_input
+// with essentially nothing else in it, and there's a substantial "note" item elsewhere in the
+// same batch, rewrite the reminder so it actually references what it's reminding the user about
+// instead of being a dead end.
+const BARE_REMIND_PATTERN =
+  /^(please\s+)?(remind me|remember)\b[\s\S]{0,40}$/i;
+
+function isBareContentlessReminder(item: StructuredItemWithRaw): boolean {
+  if (item.type !== "reminder") return false;
+  const text = (item.raw_input ?? item.title ?? "").trim();
+  return BARE_REMIND_PATTERN.test(text);
+}
+
+function attachReminderToNearestNote(items: StructuredItemWithRaw[]): StructuredItemWithRaw[] {
+  const noteIdx = items.findIndex((it) => it.type === "note" && (it.details?.length ?? 0) > 40);
+  if (noteIdx === -1) return items;
+  const note = items[noteIdx];
+  const noteGist = (note.title || note.details || "your note").slice(0, 60);
+
+  return items.map((it) => {
+    if (!isBareContentlessReminder(it)) return it;
+    return {
+      ...it,
+      title: `Revisit: ${noteGist}`,
+      details: it.details && it.details.trim() ? it.details : `Follow up on your note: "${noteGist}"`,
+    };
+  });
+}
+
+export async function structureMultipleInputs(
+  raw: string,
+  todayISO: string,
+  currentTimeHHMM: string,
+  existingItems: ExistingItemContext[] = []
+): Promise<StructuredItemWithRaw[]> {
+  const userMsg = `CURRENT_DATE: ${todayISO}
+CURRENT_TIME: ${currentTimeHHMM} (24h)
+
+EXISTING_ITEMS:
+${formatExistingItemsBlock(existingItems)}
+
+User input: """${raw}"""`;
+
+  const rawResponse = await callGroq(
+    [
+      { role: "system", content: MULTI_STRUCTURING_SYSTEM_PROMPT },
+      { role: "user", content: userMsg },
+    ],
+    true, estimateMultiItemMaxTokens(raw)
+  );
+  let cleaned = rawResponse.trim();
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    throw new Error("GROQ_BAD_JSON");
+  }
+  const itemsRaw: unknown[] = Array.isArray((parsed as any)?.items) ? (parsed as any).items : [];
+  // Each item's raw_input, linked_item_index, etc. come straight from the model here (per the
+  // instructions above) — unlike the single-item path, we can't deterministically compute these
+  // ourselves since we don't know in advance how the block was split or cross-referenced.
+  const items: StructuredItemWithRaw[] = itemsRaw.map((it: unknown) => parseStructuredItem(JSON.stringify(it)));
+
+  const enriched = items.map((item) => {
+    let next = enforceLinkedSuggestion(item, existingItems);
+    next = enforceBatchLinkedSuggestion(next, items);
+    const duringAnchor =
+      findExistingItemById(existingItems, next.linked_existing_id) ??
+      resolveBatchAnchor(items, next.linked_item_index);
+    next = enforceDuringEventTiming(next, duringAnchor);
+    next = clampMealSuggestion(next, todayISO, currentTimeHHMM);
+    next = resolveAmbiguousBareTime(next, raw, currentTimeHHMM);
+    return next;
+  });
+
+  const fixed = attachReminderToNearestNote(enriched);
+
+  return fixed.map((item) => clampOffsetToNotBePast(item, todayISO, currentTimeHHMM));
+}
+
+// ----------------- TIME SUGGESTIONS FOR THE FOLLOW-UP CARD -----------------
+// When a captured item is missing a date/time, the follow-up card offers three quick buttons
+// instead of an empty text box: "Any time" plus the two times the AI thinks are most sensible.
+// Now also takes existingItems so a suggestion like "grab a coffee during work" can actually be
+// checked against a real recurring work block instead of a blind guess.
+export async function suggestTimesForItem(
+  title: string,
+  details: string | null,
+  todayISO: string,
+  currentTimeHHMM: string,
+  existingItems: ExistingItemContext[] = []
+): Promise<{ label: string; date: string; time: string }[]> {
+  const systemPrompt = `Given a reminder/task title, suggest the two most sensible specific
+moments (date + 24h time) for it, given the current date/time and EXISTING_ITEMS (the user's real
+upcoming reminders/calendar events, useful for things like inferring actual work hours). Prefer
+the *next* naturally sensible occurrence — don't suggest a time that's already passed today. Vary
+the two suggestions meaningfully (e.g. don't suggest 5:00 and 5:05). If the title references a
+meal (breakfast/lunch/dinner), keep both suggestions inside that meal's ordinary window
+(breakfast 07:00-10:00, lunch 12:00-14:00, dinner 18:00-21:00).
+
+Return ONLY strict JSON, no markdown: {"suggestions": [{"label": string, "date": "YYYY-MM-DD",
+"time": "HH:MM"}, {"label": string, "date": "YYYY-MM-DD", "time": "HH:MM"}]}
+"label" is a short human phrase like "This evening" or "Tomorrow morning".`;
+
+  const userPrompt = `CURRENT_DATE: ${todayISO}. CURRENT_TIME: ${currentTimeHHMM} (24h).
+Title: ${title}
+Details: ${details ?? "none"}
+
+EXISTING_ITEMS:
+${formatExistingItemsBlock(existingItems)}
+
+Suggest.`;
+
+  try {
+    const raw = await callGroq(
+      [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      true, 250
+    );
+    const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+    const parsed = JSON.parse(cleaned);
+    const suggestions = Array.isArray(parsed?.suggestions) ? parsed.suggestions : [];
+    return suggestions
+      .filter((s: any) => s?.date && s?.time)
+      .slice(0, 2)
+      .map((s: any) => ({ label: String(s.label ?? "Suggested time"), date: String(s.date), time: String(s.time) }));
+  } catch {
+    return [];
+  }
+}
+
+function parseStructuredItem(raw: string): StructuredItemWithRaw {
+  let cleaned = raw.trim();
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+  }
+  const parsed = JSON.parse(cleaned);
+  if (!parsed || typeof parsed !== "object") throw new Error("GROQ_BAD_JSON");
+  const type = parsed.type;
+  if (type !== "note" && type !== "calendar_event" && type !== "reminder") parsed.type = "note";
+  const validCategories = ["trip", "birthday", "assignment", "deadline", "general"];
+  const category = validCategories.includes(parsed.category) ? parsed.category : "general";
+  const validRecurrence = ["once", "daily", "weekly", "weekdays", "monthly", "annually"];
+  const recurrence = validRecurrence.includes(parsed.recurrence) ? parsed.recurrence : "once";
+  const offset =
+    typeof parsed.reminder_offset_minutes === "number" && parsed.reminder_offset_minutes >= 0
+      ? parsed.reminder_offset_minutes
+      : null;
+  // Only meaningfully present when this came from the multi-item prompt (the single-item caller
+  // overwrites raw_input/linked_item_index right after calling this function).
+  const rawInput = typeof parsed.raw_input === "string" && parsed.raw_input.trim() ? parsed.raw_input.trim() : null;
+  const linkedExistingId =
+    typeof parsed.linked_existing_id === "string" && parsed.linked_existing_id.trim()
+      ? parsed.linked_existing_id.trim()
+      : null;
+  const linkedItemIndex =
+    typeof parsed.linked_item_index === "number" && parsed.linked_item_index >= 0
+      ? parsed.linked_item_index
+      : null;
+  const suggestedDate = parsed.suggested_date ? String(parsed.suggested_date) : null;
+  const suggestedTime = parsed.suggested_time ? String(parsed.suggested_time) : null;
+  const suggestionReason =
+    typeof parsed.suggestion_reason === "string" && parsed.suggestion_reason.trim()
+      ? parsed.suggestion_reason.trim()
+      : null;
+  const secondaryReminderRaw = parsed.secondary_reminder;
+  const secondaryReminder =
+    secondaryReminderRaw && typeof secondaryReminderRaw === "object"
+      ? {
+          date: secondaryReminderRaw.date ? String(secondaryReminderRaw.date) : null,
+          time: secondaryReminderRaw.time ? String(secondaryReminderRaw.time) : null,
+          title:
+            typeof secondaryReminderRaw.title === "string" && secondaryReminderRaw.title.trim()
+              ? secondaryReminderRaw.title.trim()
+              : "Follow up",
+        }
+      : null;
+
+  return {
+    type: parsed.type,
+    title: String(parsed.title ?? "").slice(0, 120) || "Untitled",
+    details: String(parsed.details ?? ""),
+    date: parsed.date ? String(parsed.date) : null,
+    time: parsed.time ? String(parsed.time) : null,
+    time_range_end: parsed.time_range_end ? String(parsed.time_range_end) : null,
+    recurring: Boolean(parsed.recurring) || recurrence !== "once",
+    recurrence,
+    category,
+    reminder_offset_minutes: offset,
+    needs_confirmation: Boolean(parsed.needs_confirmation),
+    raw_input: rawInput,
+    linked_existing_id: linkedExistingId,
+    linked_item_index: linkedItemIndex,
+    suggested_date: suggestedDate,
+    suggested_time: suggestedTime,
+    suggestion_reason: suggestionReason,
+    secondary_reminder: secondaryReminder,
+  };
+}
+
+// ----------------- DAILY BRIEF GENERATION -----------------
+
+function describeReasons(reasons: string[]): string {
+  if (!reasons || reasons.length === 0) return "";
+  const map: Record<string, string> = {
+    forget_things: "the user sometimes forgets things",
+    plan_better: "the user wants to plan better",
+    daily_reset: "the user wants a daily reset moment",
+    calm_mornings: "the user wants calmer mornings",
+    stay_organized: "the user wants to stay organized",
+    other: "the user wanted a personal assistant",
+  };
+  return reasons.map((r) => map[r] ?? r).join("; ");
+}
+
+// NOTE: every formatter below prefers the user's own raw_input text (if present on the item as
+// `rawInput` / `raw_input`) as the source of truth for WHAT to say, and only uses the structured
+// date/time fields for WHEN. Cast to `any` since these extra fields may not exist on every call
+// site's exact BriefContext shape.
+function rawOf(item: any): string | null {
+  return item?.rawInput ?? item?.raw_input ?? null;
+}
+
+function formatEvents(events: BriefContext["events"]): string {
+  if (!events || events.length === 0) return "Nothing on the calendar.";
+  return events
+    .map((e: any) => {
+      const timeLabel = e.time ? formatTime12h(e.time) : null;
+      const raw = rawOf(e);
+      return `- "${e.title}"${timeLabel ? ` at ${timeLabel}` : ""}${e.details ? ` — ${e.details}` : ""}${raw ? ` [user's own words: "${raw}"]` : ""}`;
+    })
+    .join("\n");
+}
+
+function formatReminders(r: BriefContext["pendingReminders"]): string {
+  if (!r || r.length === 0) return "No pending reminders.";
+  return r
+    .map((x: any) => {
+      const timeLabel = x.dueTime ? formatTime12h(x.dueTime) : null;
+      const raw = rawOf(x);
+      return `- "${x.title}"${timeLabel ? ` (due ${timeLabel})` : ""}${x.details ? ` — ${x.details}` : ""}${raw ? ` [user's own words: "${raw}"]` : ""}`;
+    })
+    .join("\n");
+}
+
+function formatHighlights(h: BriefContext["highlights"]): string {
+  if (!h || h.length === 0) return "Nothing extra to flag ahead of time.";
+  return h
+    .map((x: any) => {
+      const timeLabel = x.dueTime ? formatTime12h(x.dueTime) : "";
+      const raw = rawOf(x);
+      return `- [${x.category}] ${x.text} (due ${x.dueDate}${timeLabel ? ` ${timeLabel}` : ""})${raw ? ` [user's own words: "${raw}"]` : ""}`;
+    })
+    .join("\n");
+}
+
+function formatCollisions(c: BriefContext["collisions"]): string {
+  if (!c || c.length === 0) return "No scheduling conflicts.";
+  return c
+    .map((x) => `- "${x.titleA}" at ${formatTime12h(x.timeA)} overlaps "${x.titleB}" at ${formatTime12h(x.timeB)}`)
+    .join("\n");
+}
+
+export async function generateDailyBrief(ctx: BriefContext): Promise<string> {
+  const anyCtx = ctx as any;
+  const phase: "morning" | "restOfDay" = anyCtx.phase ?? (ctx.mode === "morning" ? "morning" : "restOfDay");
+  const hasRemainingToday: boolean = anyCtx.hasRemainingToday ?? true;
+  const previewTomorrow: boolean = anyCtx.previewTomorrow ?? false;
+  const tomorrowEvents: BriefContext["events"] = anyCtx.tomorrowEvents ?? [];
+  const tomorrowReminders: BriefContext["pendingReminders"] = anyCtx.tomorrowReminders ?? [];
+
+  const phaseLine =
+    phase === "morning"
+      ? `This is a MORNING brief. Cover the ENTIRE day ahead (today) from start to finish, plus
+anything else important even if it isn't due today (see "things to flag early" below).`
+      : hasRemainingToday
+      ? `This is a LATER-IN-THE-DAY brief. First, cover ONLY what is still ahead today — from
+right now until today ends. Do NOT mention anything whose time has already passed today. Then,
+after fully covering what's left today, start a NEW paragraph previewing tomorrow, clearly
+introduced (e.g. "Looking ahead to tomorrow…" or "Here's how tomorrow looks:"), using the
+tomorrow's calendar/reminders data provided below. Keep the two clearly separated — today's
+remaining items first, tomorrow's preview second — never blend them into one sentence.`
+      : `This is a LATER-IN-THE-DAY brief, and there is nothing left pending for the rest of
+today. Say that plainly in one short line (e.g. "Nothing left on your plate for the rest of
+today."). Then start a NEW paragraph previewing tomorrow, clearly introduced (e.g. "Here's how
+tomorrow looks:"), using the tomorrow's calendar/reminders data provided below.`;
+
+  const weatherLine =
+    ctx.weatherNow || ctx.weatherEvening
+      ? `Current weather: ${ctx.weatherNow ? `${ctx.weatherNow.tempC}°C, ${ctx.weatherNow.condition}` : "unknown"}.\n` +
+        `Evening forecast: ${ctx.weatherEvening ? `${ctx.weatherEvening.tempC}°C, ${ctx.weatherEvening.condition}` : "unknown"}.`
+      : "Weather unavailable.";
+
+  const reasons = describeReasons(ctx.onboardingReasons);
+
+  const systemPrompt = `You are the voice of "Daily Brief", a warm, calm personal assistant that
+speaks to the user throughout their day like a thoughtful human assistant would — never robotic,
+never a flat list of facts.
+
+CRITICAL DATE/TIME RULES — read carefully, this is the most important part:
+- The exact current date is "${ctx.date}" and the exact current time is "${ctx.currentTime}".
+  Use these EXACTLY as given. Never recompute, guess, shift, or "correct" the weekday or date
+  yourself — whatever weekday is in "${ctx.date}" is correct, full stop.
+- ALWAYS state every clock time in plain 12-hour format with am/pm (e.g. "1 PM", "1:30 PM").
+  NEVER use 24-hour format like "13:00" or "13:30" anywhere in your output.
+- Use natural, contextual phrasing — not a stacked run-on paragraph. Give each event/reminder
+  its own clear clause or sentence. Where it reads naturally, add plain context (e.g. "at noon",
+  "which is right around lunchtime", "back-to-back with your X meeting"). Don't just recite times.
+- When two things overlap, name both plainly with their times and flag the conflict — don't bury it.
+
+SOURCE OF TRUTH:
+- Each calendar/reminder/highlight item below may include "[user's own words: ...]" — that is
+  the user's own original phrasing and is what actually tells you their intent. Use it as the
+  basis for what you say about that item. The title/details are a cleaned-up label; the due
+  date/time fields are authoritative for WHEN something happens, but not for HOW to describe it.
+
+TONE:
+- Warm and conversational, vary phrasing day to day, never open with the same words twice. Use
+  the user's name once, naturally.
+- Weather: practical advice ("grab an umbrella"), not just numbers.
+- Narrate chronologically start to finish. Chain consequences into the same breath as the event
+  they belong to -- the time, what's happening, and any prep tied to it, together.
+- NEVER phrase a reminder as already completed ("you've remembered to...", "you've already
+  handled..."). Always forward-looking: "don't forget to...", "make sure to...", "you'll want
+  to...".
+- ${reasons ? `Context about the user: ${reasons}.` : ""}
+
+LENGTH AND DETAIL — this overrides any instinct to summarize:
+- NO length cap, and NEVER compress multiple items into a vague collective line (e.g. "you have a
+  few meetings today" is a failure). Every calendar event, reminder, highlight, and conflict below
+  must be individually named with its own time and detail -- a busy day produces a longer brief, a
+  quiet day a shorter one; never trade completeness for brevity.
+- "Conversational" means the STYLE of delivery (warm prose, not a bulleted list) -- never a reason
+  to drop or merge items.
+
+STRUCTURE FOR THIS BRIEF:
+${phaseLine}
+- If there are scheduling CONFLICTS, name both events and times plainly and ask what the user
+  wants to do about it (move one, or let the assistant pick).
+- If there are HIGHLIGHTS (things surfacing early — trips, birthdays, assignments, deadlines),
+  state exactly what they are and why now, specifically — not "you have upcoming reminders."
+- Pending reminders — name them exactly with their time, don't just give a count.
+- Mention unread notes only if > 0, and quote the gist if directly relevant today.
+
+END EVERY BRIEF with this exact prompt, worded warmly and adapted only for grammar:
+"Anything you'd like me to remember or add — to your notes or your calendar — before we
+continue the day?"
+
+Return ONLY the brief text. No preamble, no markdown, no headers, no quotes around it.`;
+
+  const tomorrowBlock = previewTomorrow
+    ? `\n\nTomorrow's calendar:\n${formatEvents(tomorrowEvents)}\n\nTomorrow's reminders:\n${formatReminders(tomorrowReminders)}`
+    : "";
+
+  const userPrompt = `Generate the brief for this context:
+
+Name: ${ctx.name}
+Date: ${ctx.date}
+Current time: ${ctx.currentTime}
+City: ${ctx.city ?? "unknown"}
+Phase: ${phase}
+
+${weatherLine}
+
+Today's calendar:
+${formatEvents(ctx.events)}
+
+Scheduling conflicts:
+${formatCollisions(ctx.collisions)}
+
+Things to flag early (lead-time highlights — trips, birthdays, assignments, deadlines):
+${formatHighlights(ctx.highlights)}
+
+Today's pending reminders:
+${formatReminders(ctx.pendingReminders)}
+
+Unread saved notes: ${ctx.unreadNotesCount}${tomorrowBlock}`;
+
+  return (
+    await callGroq(
+      [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      false,
+      3200
+    )
+  ).trim();
+}
+
+// ----------------- REMINDER NOTIFICATION TEXT -----------------
+
+export async function generateReminderNotification(
+  userName: string,
+  reminder: { title: string; details: string | null; due_time: string | null }
+): Promise<string> {
+  const systemPrompt = `Write ONE short, warm push-notification sentence (under 15 words) for a
+reminder app called Clearday, speaking directly to the user by name like a caring assistant, not a
+robotic repeat of the title. Plain 12-hour time with am/pm if mentioned (never 24h). No quotes, no
+markdown. Always forward-looking (a nudge toward something not yet done) -- never phrased as
+already handled ("you've remembered to...", "you've already...").
+
+Examples:
+"Call mom" -> "Hey Alex, I think it's time to call your mom."
+"Submit project", due 23:59 -> "Hey Alex, don't forget — your project's due by midnight."`;
+
+  const userPrompt = `User's name: ${userName}
+Reminder title: ${reminder.title}
+Details: ${reminder.details ?? "none"}
+Due time: ${reminder.due_time ? formatTime12h(reminder.due_time) : "not specified"}
+
+Write the notification line.`;
+
+  try {
+    const text = await callGroq(
+      [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      false, 90
+    );
+    return text.trim().replace(/^"|"$/g, "");
+  } catch {
+    return reminder.due_time
+      ? `Hey ${userName}, don't forget: ${reminder.title.toLowerCase()} around ${formatTime12h(reminder.due_time)}.`
+      : `Hey ${userName}, don't forget: ${reminder.title.toLowerCase()}.`;
+  }
+}
+
+// ----------------- RECURRENCE ANALYSIS -----------------
+
+export async function analyzeRecurrence(item: {
+  title: string;
+  details: string | null;
+  raw_input: string;
+  currentRecurrence: string;
+}): Promise<{ action: "delete" | "reschedule"; recurrence: import("./types").RecurrencePattern }> {
+  const systemPrompt = `A reminder/calendar item's time just passed with no snooze set. Decide:
+delete (a genuine one-off, now done) or reschedule as recurring, based on what kind of activity
+this naturally is.
+
+Return ONLY strict JSON, no markdown:
+{"action": "delete" | "reschedule", "recurrence": "once" | "daily" | "weekly" | "weekdays" | "monthly" | "annually"}
+"delete" -> recurrence "once".`;
+
+  const userPrompt = `Title: ${item.title}
+Details: ${item.details ?? "none"}
+Exactly what the user originally typed/said: "${item.raw_input}"
+Its recurrence was previously recorded as: ${item.currentRecurrence}
+
+Decide.`;
+
+  try {
+    const raw = await callGroq(
+      [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      true, 50
+    );
+    const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+    const parsed = JSON.parse(cleaned);
+    const action = parsed.action === "reschedule" ? "reschedule" : "delete";
+    const validRecurrence = ["once", "daily", "weekly", "weekdays", "monthly", "annually"];
+    const recurrence = validRecurrence.includes(parsed.recurrence) ? parsed.recurrence : "once";
+    return { action, recurrence };
+  } catch {
+    return { action: "delete", recurrence: "once" };
+  }
+}
+
+// ----------------- CROSS-REFERENCE TIME RESOLUTION -----------------
+// FLAG: this mechanism (RelatedCandidate / resolveRelatedTime) now substantially overlaps with
+// the EXISTING_ITEMS / linked_existing_id association pass built into structureInput and
+// structureMultipleInputs above. Kept as-is here since I don't know every call site that depends
+// on it, but worth considering folding callers of this into the new association pass directly
+// instead of running two separate "does this reference something existing" mechanisms.
+//
+// TIME COMPUTATION IS NO LONGER LEFT TO THE MODEL: the model's only job now is to say WHICH
+// candidate (by index) this new input is really about — a plain non-reasoning model was landing
+// on the anchor's exact start time (or worse, drifting to inconsistent times across near-
+// identical inputs — "during my walk" landing at 6pm, 7am, 7am, 8am across separate captures with
+// no real basis for the differences). A fixed, deterministic lead offset applied here in code
+// keeps every "during X" item consistent with each other and clearly distinct from the anchor's
+// own start time (so "get coffee during my walk" isn't reminding you at the exact moment you
+// haven't left the house yet).
+
+const RELATED_TIME_LEAD_MINUTES = 15;
+
+export interface RelatedCandidate {
+  title: string;
+  date: string | null;
+  time: string | null;
+  kind?: "reminder" | "calendar_event";
+}
+
+export async function resolveRelatedTime(
+  rawInput: string,
+  candidates: RelatedCandidate[]
+): Promise<{ date: string | null; time: string | null } | null> {
+  if (candidates.length === 0) return null;
+
+  const systemPrompt = `The new input may reference something already on the calendar/reminders.
+Connector phrasing like "during", "while", "in the middle of", "as part of", "right after",
+"before" all count as reference signals. Given the input and the numbered candidates, decide which
+one (if any) is really being referenced. Do NOT compute a date/time yourself -- timing is derived
+afterward from whichever candidate you pick.
+
+Return ONLY strict JSON, no markdown: {"matched_index": number | null}
+(0-based index into the candidate list, or null if no good match.)`;
+
+  const userPrompt = `New input: "${rawInput}"
+
+Candidate existing items:
+${candidates.map((c, i) => `${i}. [${c.kind ?? "unknown"}] "${c.title}" on ${c.date ?? "no date"} at ${c.time ?? "no time"}`).join("\n")}
+
+Which index matches, if any?`;
+
+  try {
+    const raw = await callGroq(
+      [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      true, 40
+    );
+    const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+    const parsed = JSON.parse(cleaned);
+    const idx = typeof parsed.matched_index === "number" ? parsed.matched_index : null;
+    if (idx === null || idx < 0 || idx >= candidates.length) return null;
+
+    const anchor = candidates[idx];
+    if (!anchor.date) return null;
+    if (!anchor.time) return { date: anchor.date, time: null };
+
+    const [ah, am] = anchor.time.split(":").map((x) => parseInt(x, 10));
+    if ([ah, am].some((n) => Number.isNaN(n))) return { date: anchor.date, time: null };
+
+    const total = (ah * 60 + am + RELATED_TIME_LEAD_MINUTES) % (24 * 60);
+    return { date: anchor.date, time: `${pad2(Math.floor(total / 60))}:${pad2(total % 60)}` };
+  } catch {
+    return null;
+  }
+}
+
+// ----------------- RANGE MIDPOINT -----------------
+
+export async function pickTimeWithinRange(startHHMM: string, endHHMM: string): Promise<string> {
+  const [sh, sm] = startHHMM.split(":").map((x) => parseInt(x, 10));
+  const [eh, em] = endHHMM.split(":").map((x) => parseInt(x, 10));
+  const startMin = sh * 60 + sm;
+  const endMin = eh * 60 + em;
+  const midMin = Math.round((startMin + endMin) / 2);
+  const h = Math.floor(midMin / 60) % 24;
+  const m = midMin % 60;
+  return `${pad2(h)}:${pad2(m)}`;
+}
+
+export async function generateConfirmationText(
+  userName: string,
+  reminder: { title: string; offsetMinutes: number | null }
+): Promise<string> {
+  const systemPrompt = `Write ONE short, warm sentence (under 20 words) confirming a deadline is now
+arriving, referencing that the user was already nudged earlier. Speak directly to the user by name.
+No markdown, no quotes, one sentence.`;
+
+  const userPrompt = `User's name: ${userName}
+Task: ${reminder.title}
+Minutes since the earlier nudge: ${reminder.offsetMinutes ?? "unknown"}
+
+Write it.`;
+
+  try {
+    const text = await callGroq(
+      [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      false, 60
+    );
+    return text.trim().replace(/^"|"$/g, "");
+  } catch {
+    return `Hey ${userName}, just checking in — this was due now: ${reminder.title.toLowerCase()}.`;
+  }
+}
+
+// ----------------- FALLBACK (non-AI) BRIEF -----------------
+
+export function fallbackBrief(ctx: BriefContext): string {
+  const anyCtx = ctx as any;
+  const phase: "morning" | "restOfDay" = anyCtx.phase ?? (ctx.mode === "morning" ? "morning" : "restOfDay");
+  const hasRemainingToday: boolean = anyCtx.hasRemainingToday ?? true;
+  const previewTomorrow: boolean = anyCtx.previewTomorrow ?? false;
+  const tomorrowEvents: BriefContext["events"] = anyCtx.tomorrowEvents ?? [];
+
+  const greeting = phase === "morning" ? `Good morning, ${ctx.name}.` : `Hi ${ctx.name}.`;
+  const dateLine = `It's ${ctx.currentTime}${ctx.city ? ` in ${ctx.city}` : ""}, ${ctx.date}.`;
+
+  const weatherLine =
+    ctx.weatherNow || ctx.weatherEvening
+      ? ctx.weatherEvening && /rain|shower|storm/i.test(ctx.weatherEvening.condition)
+        ? `It's ${ctx.weatherNow ? `${ctx.weatherNow.tempC}° and ${ctx.weatherNow.condition.toLowerCase()}` : "calm"} right now, but ${ctx.weatherEvening.condition.toLowerCase()} is expected later — you might want an umbrella.`
+        : `It's ${ctx.weatherNow ? `${ctx.weatherNow.tempC}° and ${ctx.weatherNow.condition.toLowerCase()}` : "mild"} right now.`
+      : "Weather's unavailable right now.";
+
+  let bodyLine: string;
+  if (phase === "morning") {
+    const calCount = ctx.events.length;
+    bodyLine =
+      calCount === 0
+        ? "Your calendar's clear today — a quiet one."
+        : `You've got ${calCount} thing${calCount > 1 ? "s" : ""} on deck today${
+            ctx.events[0]?.time ? ` — first up, "${ctx.events[0].title}" at ${formatTime12h(ctx.events[0].time)}` : ""
+          }.`;
+  } else if (hasRemainingToday) {
+    const calCount = ctx.events.length;
+    bodyLine =
+      calCount === 0
+        ? "Nothing left on your calendar for the rest of today."
+        : `You still have ${calCount} thing${calCount > 1 ? "s" : ""} left today${
+            ctx.events[0]?.time ? ` — next up, "${ctx.events[0].title}" at ${formatTime12h(ctx.events[0].time)}` : ""
+          }.`;
+  } else {
+    const tCount = tomorrowEvents.length;
+    bodyLine =
+      "Nothing left on your plate for the rest of today. " +
+      (tCount === 0
+        ? "Tomorrow's calendar is clear so far."
+        : `Here's how tomorrow looks: ${tCount} thing${tCount > 1 ? "s" : ""} on deck${
+            tomorrowEvents[0]?.time ? `, starting with "${tomorrowEvents[0].title}" at ${formatTime12h(tomorrowEvents[0].time)}` : ""
+          }.`);
+  }
+
+  const remCount = ctx.pendingReminders.length;
+  const remLine =
+    remCount === 0
+      ? "No pending reminders."
+      : `And ${remCount} reminder${remCount > 1 ? "s" : ""} waiting for you — I'll nudge you when they come up.`;
+
+  const notesLine =
+    ctx.unreadNotesCount > 0
+      ? `You have ${ctx.unreadNotesCount} saved note${ctx.unreadNotesCount > 1 ? "s" : ""} you can revisit anytime.`
+      : "";
+
+  const closing =
+    "Anything you'd like me to remember or add — to your notes or your calendar — before we continue the day?";
+
+  return [greeting, dateLine, weatherLine, bodyLine, remLine, notesLine, closing].filter(Boolean).join(" ");
+}
+
+// ----------------- COLLISION MESSAGE -----------------
+
+export async function generateCollisionMessage(
+  eventA: { title: string; time: string },
+  eventB: { title: string; time: string }
+): Promise<string> {
+  const systemPrompt = `You write one short, friendly sentence flagging a calendar scheduling conflict.
+State both event names and times plainly in 12-hour am/pm format, then ask what to do. Under 40 words.
+No markdown, no preamble, one message only.`;
+
+  const userPrompt = `Event A: "${eventA.title}" at ${formatTime12h(eventA.time)}
+Event B: "${eventB.title}" at ${formatTime12h(eventB.time)}
+
+Write the conflict message.`;
+
+  try {
+    const text = await callGroq(
+      [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      false, 100
+    );
+    return text.trim().replace(/^"|"$/g, "");
+  } catch {
+    return `Heads up — "${eventA.title}" at ${formatTime12h(eventA.time)} and "${eventB.title}" at ${formatTime12h(eventB.time)} are close together. Want me to move one, or would you like to pick a time yourself?`;
+  }
+}
+
+// ----------------- OFFLINE-SAFE TEXT HELPERS (no network calls) -----------------
+// Used by the capture screen's offline mode, where no Groq call can be made at all — not even a
+// try/catch fallback attempt, since that would just waste time waiting on a request that can't
+// possibly succeed. Mirrors the tone of the AI-generated versions closely enough that switching
+// between online/offline doesn't feel jarring.
+
+export function offlineReminderNotificationText(
+  userName: string,
+  title: string,
+  dueTime: string | null
+): string {
+  return dueTime
+    ? `Hey ${userName}, don't forget: ${title.toLowerCase()} around ${formatTime12h(dueTime)}.`
+    : `Hey ${userName}, don't forget: ${title.toLowerCase()}.`;
+}
+
+export function offlineCollisionMessage(
+  eventATitle: string,
+  eventATime: string,
+  eventBTitle: string,
+  eventBTime: string
+): string {
+  return `"${eventATitle}" at ${formatTime12h(eventATime)} and "${eventBTitle}" at ${formatTime12h(
+    eventBTime
+  )} are close together. Move one, or keep both?`;
+}
